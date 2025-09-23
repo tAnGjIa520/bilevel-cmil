@@ -28,7 +28,7 @@ feat_dir: 'embeddings'  # 特征文件存储的子目录名称
 classes_order: ['2', '4', '0', '5', '3', '1']  # 连续学习中类别出现的顺序
 n_folds: 1  # 交叉验证的折数
 n_classes: 6  # 总类别数
-n_tasks: 2  # 连续学习任务数：可选2、3、5
+n_tasks: 3  # 连续学习任务数：可选2、3、5
 
 # =============== TRAINING CONFIGURATION ===============
 # 训练参数配置 - DEBUG优化版本
@@ -41,7 +41,7 @@ opt: adam  # 优化器类型
 lr: [1e-3, 1e-3, 1e-3, 1e-3, 1e-3]  # 调试时使用较大学习率加快收敛
 weight_decay: 0.  # L2正则化权重衰减
 seed: 1  # 随机种子，用于结果复现
-epochs: [2, 2, 2]  # 调试时每个任务只训练2轮，快速验证流程
+epochs: [10, 10, 10]  # 调试时每个任务只训练2轮，快速验证流程
 testing: False  # 是否为测试模式
 load: null  # 预训练模型路径，null表示从头训练
 debug: 'lite'  # 调试模式：设置为'lite'进行快速检查

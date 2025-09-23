@@ -20,6 +20,7 @@ import copy
 from collections import defaultdict
 import random
 from mil_bcsr_coreset import BCSR_Coreset
+from torch.utils.tensorboard import SummaryWriter
 
 
 # use pure pytorch instead of pytorch-lightning
@@ -288,8 +289,8 @@ def init_args():
         if hasattr(args, 'n_tasks'):
             args.n_tasks = 2
     elif args.debug == 'full':
-        args.n_batches = 20
-        args.epochs = 3
+        args.n_batches = 10
+        args.epochs = 5
         args.wandb_mode = 'disabled'
 
 
@@ -425,6 +426,14 @@ def one_fold(args, fold=0):
     fabric = Fabric(devices=1, accelerator="auto")
     seed_everything(args.seed)
 
+    # 初始化 TensorBoard writer
+    tb_log_dir = f'logs/{args.exp_name}/fold_{fold}/tensorboard'
+    writer = SummaryWriter(log_dir=tb_log_dir)
+
+
+    # 初始化全局 epoch 计数器
+    global_epoch = 0
+
     # 加载并初始化模型
     model = load_model(args)
     model = fabric.to_device(model)
@@ -531,6 +540,7 @@ def one_fold(args, fold=0):
             train_loss_metric = MeanMetric()
             val_loss_metric = MeanMetric()
 
+
             # 根据分类任务类型初始化准确率计算器
             if args.n_classes == 2:
                 val_acc_metric = fabric.to_device(Accuracy(task='binary'))
@@ -588,6 +598,7 @@ def one_fold(args, fold=0):
 
                     # 更新训练损失并记录
                     train_loss_metric.update(loss.item())
+
                     logger_batch.update({'loss': loss.item()})
                     logger.log_metrics(logger_batch)
 
@@ -628,6 +639,7 @@ def one_fold(args, fold=0):
 
                     # 更新训练损失并记录
                     train_loss_metric.update(loss.item())
+
                     logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item(), 'loss': loss.item()})
                     logger.log_metrics(logger_batch)
                 else:
@@ -707,6 +719,7 @@ def one_fold(args, fold=0):
                             inst_loss = out['instance_loss']
                             loss = 0.7*bag_loss + 0.3*inst_loss
                             logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item()})
+
 
                             if hasattr(args, 'cl_method'):
                                 if args.cl_method == 'LwF' and task > 0:
@@ -808,7 +821,23 @@ def one_fold(args, fold=0):
                 val_loss_metric.reset()
                 val_acc_metric.reset()
                 # val_auc_metric.reset()
-                logger.log_metrics({'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss, 'val_acc_epoch': val_acc})
+
+                # CSV 日志记录
+                log_dict = {'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss, 'val_acc_epoch': val_acc}
+
+
+                logger.log_metrics(log_dict)
+
+                # TensorBoard 记录 - 任务独立视图
+                writer.add_scalar(f'task_{task}/train_loss_epoch', train_loss, i)
+                writer.add_scalar(f'task_{task}/val_loss_epoch', val_loss, i)
+                writer.add_scalar(f'task_{task}/val_acc_epoch', val_acc, i)
+
+                # TensorBoard 记录 - 连续视图
+                writer.add_scalar('continuous/train_loss_epoch', train_loss, global_epoch)
+                writer.add_scalar('continuous/val_loss_epoch', val_loss, global_epoch)
+                writer.add_scalar('continuous/val_acc_epoch', val_acc, global_epoch)
+
             else:
                 train_loss = train_loss_metric.compute().item()
                 val_loss = val_loss_metric.compute().item()
@@ -817,6 +846,14 @@ def one_fold(args, fold=0):
                 train_loss_metric.reset()
                 val_loss_metric.reset()
                 logger.log_metrics({'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss})
+
+                # TensorBoard 记录 - 任务独立视图
+                writer.add_scalar(f'task_{task}/train_loss_epoch', train_loss, i)
+                writer.add_scalar(f'task_{task}/val_loss_epoch', val_loss, i)
+
+                # TensorBoard 记录 - 连续视图
+                writer.add_scalar('continuous/train_loss_epoch', train_loss, global_epoch)
+                writer.add_scalar('continuous/val_loss_epoch', val_loss, global_epoch)
 
             # ====== 3.4 早停机制检查 ======
             if args.early_stop:
@@ -828,6 +865,9 @@ def one_fold(args, fold=0):
                 if early_stop.early_stop:
                     print("Early stopping")
                     break
+
+            # 增加全局 epoch 计数器
+            global_epoch += 1
 
         # ====== 4. 模型保存和加载最佳权重 ======
         # 如果没有使用早停，在训练结束后保存模型
@@ -976,7 +1016,10 @@ def one_fold(args, fold=0):
         # 记录任务完成状态
         logger.finalize(f"Success on fold {fold} task {task}!")
 
-    # ====== 8. 返回所有任务的测试结果 ======
+    # ====== 8. 清理 TensorBoard writer ======
+    writer.close()
+
+    # ====== 9. 返回所有任务的测试结果 ======
     return results # [{'fold': 0, 'task': 0, '0_auc': 0.9, '0_acc': 0.8}, {...}, ...]
 
 
