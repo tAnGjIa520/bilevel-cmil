@@ -1,0 +1,1 @@
+--preset configs/csc_clam_cl.yaml --cl_method prev --buffer_size 84 --exp_name csc_clam_cl_buf84_attn_logit

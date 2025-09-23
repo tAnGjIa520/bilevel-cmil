@@ -1,0 +1,56 @@
+# proj setting
+project: 'CMIL'
+exp_name: 'csc_clam_cl'
+wandb_mode: 'disabled' # 'online', 'offline', 'disabled'
+
+# model setting
+model: clam_sb # clam_sb, clam_mb
+net: 'clam_sb'
+D_feat: 512
+L: 512
+D: 256
+K: 1 # clam_sb: 1, clam_mb: n_classes
+dropout: True
+gate: True
+k_sample: 8
+subtyping: True
+instance_loss_name: 'svm'
+bag_weight: 0.7
+feature_extractor: null
+
+# dataset setting
+dataset: 'csc_cl'
+data_root: '/root/cmil/MICIL-main/local_data'
+feat_dir: 'embeddings'
+classes_order: ['2', '4', '0', '5', '3', '1']
+n_folds: 1
+n_classes: 6
+n_tasks: 3 # 2, 3, 5
+
+# train setting
+batch_size: 1
+weighted_sample: False
+n_batches: -1
+early_stop: False
+patience: 10
+opt: adam
+lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4] # float or list
+weight_decay: 0.
+seed: 1
+#epochs: [40, 50, 50] # int or list
+epochs: [1, 1, 1] # int or list
+testing: False
+load: null
+debug: 'False' # False, lite/True (quick check), full (run a few steps)
+folds_start: -1
+folds_end: -1
+
+# cl setting
+cl_method: 'none' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
+buffer_size: 84 # 84
+buffer_balance: False
+buffer_slide_size: 200 # n_patches in a pseudo slide
+#distill_method: 'maxmin' # 'max', 'random', 'maxmin'
+distill_method: 'random'
+wn: False
+cl_on_current: False

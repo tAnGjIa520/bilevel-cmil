@@ -1,0 +1,56 @@
+# proj setting
+project: 'CMIL'
+exp_name: 'c16_lung_rcc_clam_cl'
+wandb_mode: 'disabled' # 'online', 'offline', 'disabled'
+
+# model setting
+model: clam_sb # clam_sb, clam_mb
+net: 'clam_sb'
+D_feat: 1024
+L: 512
+D: 256
+K: 1 # clam_sb: 1, clam_mb: n_classes
+dropout: True
+gate: True
+k_sample: 8
+subtyping: True
+feature_extractor: null
+
+# dataset setting
+dataset: 'c16_lung_rcc_cl'
+csv_file: 'c16_lung_rcc_cases.csv'
+label_dict: {'normal': 0, 'tumor': 1, 'luad': 2, 'lusc': 3, 'KICH': 4, 'KIRC': 5, 'KIRP': 6}
+data_root: '../data/TCGA_Camelyon'
+feat_dir: 'pat_256_feat_resnet'
+split_dir: 'splits/C16_lung_rcc_t2_cl'
+n_folds: 5
+n_classes: 7
+n_tasks: 3
+
+# train setting
+batch_size: 1
+weighted_sample: True
+n_batches: -1
+instance_loss_name: 'svm'
+bag_weight: 0.7
+early_stop: True
+patience: 10
+opt: adam
+lr: 0.0002
+weight_decay: 0.00001
+seed: 1
+epochs: 50
+testing: False
+load: null
+debug: 'False' # False, lite/True (quick check), full (run a few steps)
+folds_start: -1
+folds_end: -1
+
+# cl setting
+cl_method: 'none' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
+buffer_size: -1 # 84
+buffer_balance: True
+buffer_slide_size: 0.05 # n_patches in a pseudo slide
+distill_method: 'maxmin' # 'max', 'random', 'maxmin'
+wn: False
+cl_on_current: False
