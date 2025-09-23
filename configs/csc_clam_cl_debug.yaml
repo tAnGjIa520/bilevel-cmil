@@ -1,8 +1,8 @@
 # =============== PROJECT CONFIGURATION ===============
-# 项目基本设置
+# 项目基本设置 - DEBUG版本
 project: 'CMIL'  # 项目名称，用于Weights & Biases (wandb) 项目命名
-exp_name: 'csc_clam_cl'  # 实验名称，用于日志文件夹命名和实验跟踪
-wandb_mode: 'disabled'  # Weights & Biases 记录模式：'online'(在线记录), 'offline'(离线记录), 'disabled'(禁用)
+exp_name: 'csc_clam_cl_debug'  # 实验名称，专门用于调试
+wandb_mode: 'disabled'  # Weights & Biases 记录模式：调试时建议禁用
 
 # =============== MODEL CONFIGURATION ===============
 # CLAM模型架构配置
@@ -28,34 +28,41 @@ feat_dir: 'embeddings'  # 特征文件存储的子目录名称
 classes_order: ['2', '4', '0', '5', '3', '1']  # 连续学习中类别出现的顺序
 n_folds: 1  # 交叉验证的折数
 n_classes: 6  # 总类别数
-n_tasks: 3  # 连续学习任务数：可选2、3、5
+n_tasks: 2  # 连续学习任务数：可选2、3、5
 
 # =============== TRAINING CONFIGURATION ===============
-# 训练参数配置
+# 训练参数配置 - DEBUG优化版本
 batch_size: 1  # 批大小，MIL通常使用1 (每个batch包含一个bag)
 weighted_sample: False  # 是否使用加权采样来平衡类别
-n_batches: -1  # 每个epoch的batch数，-1表示使用所有数据
-early_stop: False  # 是否启用早停机制
+n_batches: 5  # 每个epoch的batch数，调试时限制为5个batch快速验证
+early_stop: False  # 调试时关闭早停，确保完整运行
 patience: 10  # 早停耐心值，连续多少个epoch无改善后停止
 opt: adam  # 优化器类型
-lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4]  # 学习率，可以是单值或为每个任务设置不同学习率的列表
+lr: [1e-3, 1e-3, 1e-3, 1e-3, 1e-3]  # 调试时使用较大学习率加快收敛
 weight_decay: 0.  # L2正则化权重衰减
 seed: 1  # 随机种子，用于结果复现
-epochs: [40, 50, 50]  # 原始epoch设置（已注释）
-# epochs: [1, 1, 1]  # 每个连续学习任务的训练轮数列表，当前为测试设置
+epochs: [2, 2, 2]  # 调试时每个任务只训练2轮，快速验证流程
 testing: False  # 是否为测试模式
 load: null  # 预训练模型路径，null表示从头训练
-debug: 'False'  # 调试模式：False(正常), 'lite'/'True'(快速检查), 'full'(运行几步)
+debug: 'lite'  # 调试模式：设置为'lite'进行快速检查
 folds_start: -1  # 开始的fold索引，-1表示从头开始
 folds_end: -1  # 结束的fold索引，-1表示到最后
 
 # =============== CONTINUAL LEARNING CONFIGURATION ===============
-# 连续学习方法配置
-cl_method: 'none'  # 连续学习方法：'none'(无), 'finetune'(微调), 'ewc'(弹性权重巩固), 'replay'(重放), 'full-replay'(完全重放), 'joint'(联合训练)
-buffer_size: 84  # 经验重放缓冲区大小，存储的样本数量
+# 连续学习方法配置 - DEBUG简化版本
+cl_method: 'LwF'  # 连续学习方法：调试时使用'none'简化流程
+buffer_size: 10  # 经验重放缓冲区大小，调试时使用小缓冲区
 buffer_balance: False  # 缓冲区是否保持类别平衡
-buffer_slide_size: 200  # 伪滑片中的patch数量，用于特征蒸馏
-#distill_method: 'maxmin'  # 原始蒸馏方法（已注释）
-distill_method: 'random'  # 特征蒸馏方法：'max'(最高注意力), 'random'(随机采样), 'maxmin'(最高+最低注意力)
+buffer_slide_size: 50  # 伪滑片中的patch数量，调试时减少数量
+distill_method: 'random'  # 特征蒸馏方法：调试时使用简单的随机采样
 wn: False  # 是否对全连接层权重进行归一化
 cl_on_current: False  # 是否在当前任务数据上应用连续学习方法
+
+# =============== DEBUG SPECIFIC NOTES ===============
+# 调试专用说明：
+# 1. n_batches=5: 每个epoch只处理5个batch，快速验证代码逻辑
+# 2. epochs=[2,2,2]: 每个连续学习任务只训练2轮
+# 3. lr提高到1e-3: 加快收敛速度，便于观察训练过程
+# 4. debug='lite': 启用轻量级调试模式
+# 5. buffer_size=10: 小缓冲区减少内存占用
+# 6. buffer_slide_size=50: 减少特征蒸馏的计算量
