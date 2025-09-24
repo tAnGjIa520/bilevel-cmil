@@ -144,7 +144,7 @@ class Training():
 
             # 计算加权输入特征：每个样本乘以对应的权重
             # (sample_weights * data.T).T 实现了逐样本的权重缩放
-            weighted_data = (sample_weights * data.T).T
+            weighted_data = (sample_weights * data.T).T #
 
             # 通过代理模型进行前向传播
             output = self.proxy_model(

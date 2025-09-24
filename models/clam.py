@@ -174,54 +174,134 @@ class CLAM_SB(nn.Module):
         return instance_loss, p_preds, p_targets, logits
 
     def forward(self, h, label=None, instance_eval=False, return_features=False, attention_only=False, **kwargs):
-        A, h = self.attention_net(h)  # NxK        
-        A = torch.transpose(A, 1, 0)  # KxN
+        """
+        CLAM 模型的前向传播函数
+
+        该函数实现了 CLAM (Clustering-constrained Attention Multiple instance learning) 的核心逻辑：
+        1. 注意力机制计算：为每个实例（patch）计算注意力权重
+        2. 实例级评估：对高注意力实例进行正负样本分类
+        3. 包级聚合：通过注意力加权聚合得到包级表示
+        4. 最终分类：基于聚合特征进行包级分类
+
+        参数:
+            h: 输入特征张量，形状为 [n_instances, feature_dim]
+                表示一个包（bag）中所有实例的特征表示
+            label: 包级标签，用于实例级监督学习 (可选)
+            instance_eval: 是否进行实例级评估和损失计算
+            return_features: 是否返回聚合后的包级特征
+            attention_only: 是否仅返回注意力权重（用于可视化）
+            **kwargs: 其他参数，包括 seen_classes 等
+
+        返回:
+            dict: 包含以下键值的字典
+                - 'logits': 包级分类的 logits，形状为 [1, n_classes]
+                - 'A': 原始注意力权重，形状为 [K, n_instances]
+                - 'instance_loss': 实例级损失 (仅当 instance_eval=True)
+                - 'features': 包级聚合特征 (仅当 return_features=True)
+        """
+
+        # ====== 1. 注意力机制计算 ======
+        # 通过注意力网络计算每个实例的注意力分数和变换后的特征
+        A, h = self.attention_net(h)  # A: [n_instances, K], h: [n_instances, feature_dim]
+
+        # 转置注意力矩阵：从 [n_instances, K] 转为 [K, n_instances]
+        A = torch.transpose(A, 1, 0)  # A: [K, n_instances]
+
+        # 如果只需要注意力权重（用于可视化），直接返回
         if attention_only:
             return A
-        A_raw = A
-        A = F.softmax(A, dim=1)  # softmax over N, [B, N]
 
+        # 保存原始注意力权重（未经过 softmax）
+        A_raw = A
+
+        # 对注意力权重应用 softmax，确保每个头的权重和为1
+        A = F.softmax(A, dim=1)  # A: [K, n_instances], 在实例维度上进行 softmax
+
+        # ====== 2. 持续学习支持：处理已见类别 ======
+        # 获取当前任务中已见过的类别，支持持续学习场景
         seen_classes = kwargs.get('seen_classes', range(self.n_classes))
+
+        # ====== 3. 实例级评估（可选） ======
         if instance_eval:
-            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze() #binarize label
-            total_inst_loss = 0.0
-            all_preds = []
-            all_targets = []
-            all_logits = []
-            # inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze() #binarize label
+            # 将包级标签转换为 one-hot 编码，用于实例级监督
+            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze()
+
+            # 初始化实例级评估的累积变量
+            total_inst_loss = 0.0      # 总实例损失
+            all_preds = []             # 所有实例预测结果
+            all_targets = []           # 所有实例目标标签
+            all_logits = []            # 所有实例 logits
+
+            # 遍历每个已见类别，进行类别特定的实例评估
             for i in seen_classes:
-                inst_label = inst_labels[i].item()
-                classifier = self.instance_classifiers[i]
-                if inst_label == 1: #in-the-class:
+                inst_label = inst_labels[i].item()  # 当前类别的标签 (0 或 1)
+                classifier = self.instance_classifiers[i]  # 当前类别的实例分类器
+
+                if inst_label == 1:  # 正样本类别 (in-the-class)
+                    # 对正样本类别进行实例评估
+                    # 选择高注意力的实例作为正样本，低注意力的作为困难负样本
                     instance_loss, preds, targets, instance_logits = self.inst_eval(A, h, classifier)
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(targets.cpu().numpy())
                     all_logits.append(instance_logits)
-                else: #out-of-the-class
+
+                else:  # 负样本类别 (out-of-the-class)
                     if self.subtyping:
+                        # 对负样本类别进行子类型分析
+                        # 有助于学习更细粒度的特征区分
                         instance_loss, preds, targets, instance_logits = self.inst_eval_out(A, h, classifier)
                         all_preds.extend(preds.cpu().numpy())
                         all_targets.extend(targets.cpu().numpy())
                         all_logits.append(instance_logits)
                     else:
+                        # 跳过负样本类别的实例评估
                         continue
+
+                # 累积实例损失
                 total_inst_loss += instance_loss
 
+            # 如果启用子类型分析，对实例损失进行平均
             if self.subtyping:
                 total_inst_loss /= len(seen_classes)
-                
-        M = torch.mm(A, h) 
-        logits = self.classifiers(M) # [B, n_classes]
-        # mask unseen classes
+
+        # ====== 4. 包级特征聚合 ======
+        # 使用注意力权重对实例特征进行加权聚合
+        # M = A @ h，其中 A: [K, n_instances], h: [n_instances, feature_dim]
+        M = torch.mm(A, h)  # M: [K, feature_dim] 聚合后的包级特征表示
+
+        # ====== 5. 包级分类 ======
+        # 通过分类器得到最终的包级分类 logits
+        logits = self.classifiers(M)  # logits: [K, n_classes] 或 [1, n_classes]
+
+        # ====== 6. 持续学习：掩码未见类别 ======
+        # 将未见过的类别的 logits 设置为很小的值，防止模型对未知类别产生高置信度预测
         if len(seen_classes) < self.n_classes:
+            # 创建未见类别的掩码
             unseen_mask = torch.ones(self.n_classes, dtype=torch.bool)
-            unseen_mask[seen_classes] = False  # Set seen classes to False 
-            logits[:, unseen_mask] = -100 
-        results_dict = {'logits': logits, 'A': A_raw}
+            unseen_mask[seen_classes] = False  # 将已见类别标记为 False
+
+            # 将未见类别的 logits 设置为 -100 (接近负无穷)
+            logits[:, unseen_mask] = -100
+
+        # ====== 7. 构建返回结果字典 ======
+        results_dict = {
+            'logits': logits,    # 包级分类 logits
+            'A': A_raw          # 原始注意力权重（用于可视化和分析）
+        }
+
+        # 添加实例级评估结果（如果启用）
         if instance_eval:
-            results_dict.update({'instance_loss': total_inst_loss, 'inst_labels': np.array(all_targets), 'inst_preds': np.array(all_preds), 'instance_logits': torch.cat(all_logits, dim=0)})
+            results_dict.update({
+                'instance_loss': total_inst_loss,                    # 实例级总损失
+                'inst_labels': np.array(all_targets),               # 实例级目标标签
+                'inst_preds': np.array(all_preds),                  # 实例级预测结果
+                'instance_logits': torch.cat(all_logits, dim=0)     # 实例级 logits
+            })
+
+        # 添加聚合特征（如果需要）
         if return_features:
-            results_dict.update({'features': M})
+            results_dict.update({'features': M})  # 包级聚合特征
+
         return results_dict
 
 class CLAM_MB(CLAM_SB):
