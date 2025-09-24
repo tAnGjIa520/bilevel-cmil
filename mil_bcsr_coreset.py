@@ -201,7 +201,10 @@ class BCSR_Coreset:
         self.training_model_op.lr_w = self.weight_lr       # 权重学习率
 
         # 双层优化主循环
+        # outer loop
         for i in range(self.max_outer_it):
+            
+            # inner loop
             # 内层优化：固定样本权重，训练模型参数
             inner_loss = self.training_model_op.train_inner(
                 X, y, task_id, coreset_weights, self.max_inner_it, seen_classes=seen_classes

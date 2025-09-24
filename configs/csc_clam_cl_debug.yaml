@@ -54,7 +54,7 @@ cl_method: 'LwF'  # 连续学习方法：调试时使用'none'简化流程
 buffer_size: 10  # 经验重放缓冲区大小，调试时使用小缓冲区
 buffer_balance: False  # 缓冲区是否保持类别平衡
 buffer_slide_size: 50  # 伪滑片中的patch数量，调试时减少数量
-distill_method: 'random'  # 特征蒸馏方法：调试时使用简单的随机采样
+distill_method: 'bilevel'  # 特征蒸馏方法：调试时使用简单的随机采样
 wn: False  # 是否对全连接层权重进行归一化
 cl_on_current: False  # 是否在当前任务数据上应用连续学习方法
 
