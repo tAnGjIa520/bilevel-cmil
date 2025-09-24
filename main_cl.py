@@ -21,6 +21,7 @@ from collections import defaultdict
 import random
 from mil_bcsr_coreset import BCSR_Coreset
 from torch.utils.tensorboard import SummaryWriter
+import time
 
 
 # use pure pytorch instead of pytorch-lightning
@@ -921,6 +922,11 @@ def one_fold(args, fold=0):
         # ====== 5. 内存缓冲区数据添加块 ======
         # 将当前任务的代表性样本添加到缓冲区，用于未来任务的回放训练
         if hasattr(args, 'cl_method') and hasattr(args, 'buffer_size') and args.buffer_size > 0:
+            # 开始监控 buffer selection
+            buffer_start_time = time.time()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
             seed_everything(args.seed)
             # 根据新增类别数量调整缓冲区大小
             buffer.adjust_buffer_size_by_new_classes(len(cur_classes))
@@ -987,7 +993,18 @@ def one_fold(args, fold=0):
             with open(f'logs/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
-            logger.log_metrics({'buffer_size': len(buffer), 'n_patches_in_buffer': buffer.n_patches_total})
+
+            # 结束监控并记录到 TensorBoard
+            buffer_end_time = time.time()
+            buffer_duration = buffer_end_time - buffer_start_time
+            buffer_peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+
+            writer.add_scalar('buffer_selection/peak_memory_mb', buffer_peak_memory, task)
+            writer.add_scalar('buffer_selection/duration_seconds', buffer_duration, task)
+
+            logger.log_metrics({'buffer_size': len(buffer), 'n_patches_in_buffer': buffer.n_patches_total,
+                              'buffer_selection_duration_seconds': buffer_duration,
+                              'buffer_selection_peak_memory_mb': buffer_peak_memory})
 
         # ====== 6. 清理内存 ======
         del train_loader, val_loader, optimizer, datamodule
