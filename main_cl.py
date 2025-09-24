@@ -397,17 +397,54 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
     elif method=="bilevel":
         # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
         # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
-        size = size // 2
+        # size = size // 2
         # coreset_select(self, model, X, y, task_id, topk, out_loss=None, ref_x=None, ref_y=None):
         proxy_model=copy.deepcopy(model)
         for param in proxy_model.parameters():
             param.requires_grad = True
 
-        BCSR_Coreset_selector = BCSR_Coreset(proxy_model, lr_proxy_model=10, beta=0.1, out_dim=100,
-                          max_outer_it=5, max_inner_it=1,
-                          weight_lr=10, candidate_batch_size=600, logging_period=1000)
-        pick, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
-                                                 topk=args.buffer_size, out_loss=None,seen_classes=seen_classes)
+        # 初始化 BCSR 核心集选择器，使用双层优化进行智能样本选择
+        # 参数说明:
+        #   - lr_proxy_model=10: 代理模型学习率
+        #   - beta=0.1: 正则化强度
+        #   - out_dim=100: 输出特征维度
+        #   - max_outer_it=5: 外层优化迭代次数
+        #   - max_inner_it=1: 内层优化迭代次数
+        #   - weight_lr=10: 选择权重学习率
+        #   - candidate_batch_size=600: 候选样本批次大小
+        #   - logging_period=1000: 日志记录周期
+        BCSR_Coreset_selector = BCSR_Coreset(
+            proxy_model,
+            lr_proxy_model=10,
+            beta=0.1,
+            out_dim=100,
+            max_outer_it=5,
+            max_inner_it=1,
+            weight_lr=10,
+            candidate_batch_size=size,
+            logging_period=1000
+        )
+
+        # 执行核心集选择：从所有 patches 中选择最具代表性的子集
+        # 输入参数:
+        #   - proxy_model: 代理模型
+        #   - slide: 特征矩阵 (所有patches)
+        #   - label: 样本标签
+        #   - task_id: 任务ID
+        #   - topk: 选择的样本数量
+        #   - seen_classes: 已见过的类别
+        # 返回结果:
+        #   - pick: 选中的样本索引
+        #   - outer_loss: 外层优化损失
+        pick, outer_loss = BCSR_Coreset_selector.coreset_select(
+            proxy_model,
+            slide.cpu().numpy(),
+            label.cpu().numpy(),
+            task_id=task_id,
+            topk=args.buffer_size,
+            out_loss=None,
+            seen_classes=seen_classes
+        )
 
         # top_p_ids = torch.topk(attn, size)[1][-1]
         # top_n_ids = torch.topk(-attn, size, dim=1)[1][-1]
