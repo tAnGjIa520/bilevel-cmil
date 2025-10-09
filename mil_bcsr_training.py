@@ -99,6 +99,7 @@ class Training():
                 G_theta.append(p-self.lr_p*g)
         v_Q = v_0
 
+
         for _ in range(3):
 
             para_list=self.proxy_model.parameters()

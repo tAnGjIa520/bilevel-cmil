@@ -463,9 +463,9 @@ def one_fold(args, fold=0):
         torch.cuda.empty_cache()
 
         # 清理之前的日志文件，设置当前任务的日志记录器
-        if os.path.exists(f'logs/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv'):
-            os.remove(f'logs/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv')
-        logger = CSVLogger(root_dir=f'logs', name=f'{args.exp_name}', version=f'fold_{fold}_task_{task}')
+        if os.path.exists(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv'):
+            os.remove(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv')
+        logger = CSVLogger(root_dir=f'{args.log_dir}', name=f'{args.exp_name}', version=f'fold_{fold}_task_{task}')
 
         # ====== 2.2 数据准备和类别管理块 ======
         # 获取当前任务的数据模块（包含训练、验证、测试数据）
@@ -829,7 +829,7 @@ def one_fold(args, fold=0):
                 early_stop(i, val_loss)
                 # 如果当前验证损失最小，保存模型
                 if early_stop.val_loss_min == val_loss:
-                    torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt')
+                    torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt')
                 # 检查是否满足早停条件
                 if early_stop.early_stop:
                     print("Early stopping")
@@ -838,10 +838,10 @@ def one_fold(args, fold=0):
         # ====== 4. 模型保存和加载最佳权重 ======
         # 如果没有使用早停，在训练结束后保存模型
         if not args.early_stop:
-            torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt')
+            torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt')
 
         # 加载最佳模型权重并切换到评估模式
-        model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt'))
+        model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt'))
         model.eval()
         torch.cuda.empty_cache()
 
@@ -913,7 +913,7 @@ def one_fold(args, fold=0):
             print(f'Number of patches in buffer: {buffer.n_patches_total}')
             print(f'Labels in buffer: {buffer.labels}')
             # 保存缓冲区类别分布到CSV文件
-            with open(f'logs/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
+            with open(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
             logger.log_metrics({'buffer_size': len(buffer), 'n_patches_in_buffer': buffer.n_patches_total})
@@ -977,7 +977,7 @@ def one_fold(args, fold=0):
         results.append(result)
         # 将结果保存到CSV文件
         df = pd.DataFrame(results)
-        df.to_csv(f'logs/{args.exp_name}/fold_{fold}_results.csv', index=False)
+        df.to_csv(f'{args.log_dir}/{args.exp_name}/fold_{fold}_results.csv', index=False)
 
         # 记录任务完成状态
         logger.finalize(f"Success on fold {fold} task {task}!")
@@ -1009,8 +1009,8 @@ def one_fold_jt(args, fold=0):
     # model, optimizer = fabric.setup(model, optimizer)
     # train_loader, val_loader = fabric.setup_dataloaders(datamodule['train_loader'], datamodule['val_loader'])
     train_loader, val_loader = datamodule['train_loader'], datamodule['val_loader']
-    
-    logger = CSVLogger(root_dir=f'logs', name=f'{args.exp_name}', version=f'fold_{fold}_JT')
+
+    logger = CSVLogger(root_dir=f'{args.log_dir}', name=f'{args.exp_name}', version=f'fold_{fold}_JT')
 
     # Fitting
     if isinstance(args.epochs, list):
@@ -1123,14 +1123,14 @@ def one_fold_jt(args, fold=0):
         if args.early_stop:
             early_stop(i, val_loss)
             if early_stop.val_loss_min == val_loss:
-                torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_JT.pt')
+                torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_JT.pt')
             if early_stop.early_stop:
                 print("Early stopping")
                 break
 
     del train_loader, val_loader, optimizer
     # testing, log acc and auc
-    model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_JT.pt'))
+    model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_JT.pt'))
     model.eval()
 
     if args.n_classes == 2:
@@ -1177,7 +1177,7 @@ def one_fold_jt(args, fold=0):
 
     print(result)
     df = pd.DataFrame(result, index=[0])
-    df.to_csv(f'logs/{args.exp_name}/fold_{fold}_results_JT.csv', index=False)
+    df.to_csv(f'{args.log_dir}/{args.exp_name}/fold_{fold}_results_JT.csv', index=False)
     logger.finalize(f"Success on fold {fold}!")
     return result
 
@@ -1196,7 +1196,7 @@ def test_on_one_fold(args, fold=0):
         if args.load is not None:
             model.load_state_dict(torch.load(args.load))
         else:
-            model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_task_{model_idx}.pt'))
+            model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{model_idx}.pt'))
         model = fabric.to_device(model)
         model.eval()
 
@@ -1271,13 +1271,13 @@ def test(args):
 
     # convert to csv
     df = pd.DataFrame(results)
-    log_path = f'logs/{args.exp_name}'
+    log_path = f'{args.log_dir}/{args.exp_name}'
     if not os.path.exists(log_path):
         os.makedirs(log_path)
     df.to_csv(f'{log_path}/test_results.csv', index=False)
 
 def main(args):
-    log_path = f'logs/{args.exp_name}'
+    log_path = f'{args.log_dir}/{args.exp_name}'
     if not os.path.exists(log_path): # log文件
         os.makedirs(log_path)
     # save args to yaml
@@ -1292,7 +1292,7 @@ def main(args):
             result = one_fold(args, fold=fold)
 
         results.extend(result)
-
+    
     # convert to csv
     df = pd.DataFrame(results)
     df.to_csv(f'{log_path}/results.csv', index=False)

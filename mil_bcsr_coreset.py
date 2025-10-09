@@ -69,6 +69,7 @@ class BCSR_Coreset:
             X = torch.from_numpy(X).float()
         n = X.shape[0]
         self.training_model_op.proxy_model.load_state_dict(model.state_dict())
+        
         # initialize sample weights
         coreset_weights = 1.0/n*torch.ones([n], dtype=torch.float, requires_grad=True)
         # project sample weights onto simplex

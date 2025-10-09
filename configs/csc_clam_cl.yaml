@@ -2,6 +2,7 @@
 project: 'CMIL'
 exp_name: 'csc_clam_cl'
 wandb_mode: 'disabled' # 'online', 'offline', 'disabled'
+log_dir: 'logs' # directory for saving logs and checkpoints
 
 # model setting
 model: clam_sb # clam_sb, clam_mb

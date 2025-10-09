@@ -2,6 +2,7 @@
 project: 'CMIL'
 exp_name: 'c16_lung_rcc_transmil_cl'
 wandb_mode: 'disabled' # 'online', 'offline', 'disabled'
+log_dir: 'logs' # directory for saving logs and checkpoints
 
 # model setting
 model: transmil
