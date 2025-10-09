@@ -44,3 +44,13 @@ buffer_slide_size: -1 # n_patches in a pseudo slide
 distill_method: 'A' # 'topA', 'random'
 wn: False # normalize fc weights
 cl_on_current: False
+
+# BCSR Coreset hyperparameters
+bcsr_lr_proxy_model: 10  # learning rate for proxy model
+bcsr_beta: 0.1  # beta parameter
+bcsr_out_dim: 100  # output dimension
+bcsr_max_outer_it: 5  # maximum outer iterations
+bcsr_max_inner_it: 1  # maximum inner iterations
+bcsr_weight_lr: 10  # weight learning rate
+bcsr_candidate_batch_size: 600  # candidate batch size
+bcsr_logging_period: 1000  # logging period

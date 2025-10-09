@@ -402,9 +402,15 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         for param in proxy_model.parameters():
             param.requires_grad = True
 
-        BCSR_Coreset_selector = BCSR_Coreset(proxy_model, lr_proxy_model=10, beta=0.1, out_dim=100,
-                          max_outer_it=5, max_inner_it=1,
-                          weight_lr=10, candidate_batch_size=600, logging_period=1000)
+        BCSR_Coreset_selector = BCSR_Coreset(proxy_model,
+                          lr_proxy_model=args.bcsr_lr_proxy_model,
+                          beta=args.bcsr_beta,
+                          out_dim=args.bcsr_out_dim,
+                          max_outer_it=args.bcsr_max_outer_it,
+                          max_inner_it=args.bcsr_max_inner_it,
+                          weight_lr=args.bcsr_weight_lr,
+                          candidate_batch_size=args.bcsr_candidate_batch_size,
+                          logging_period=args.bcsr_logging_period)
         pick, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
                                                  topk=args.buffer_size, out_loss=None,seen_classes=seen_classes)
 
