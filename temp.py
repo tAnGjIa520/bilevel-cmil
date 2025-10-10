@@ -20,8 +20,7 @@ import copy
 from collections import defaultdict
 import random
 from mil_bcsr_coreset import BCSR_Coreset
-from tools.cl_metrics import compute_all_folds_metrics
-from tools.print_metrics import print_cl_metrics_table
+from torch.utils.tensorboard import SummaryWriter
 import time
 
 
@@ -249,25 +248,11 @@ class EarlyStopping:
             self.counter = 0
 
     
-def parse_list_arg(value_str):
-    """解析命令行中的列表参数，例如 '[1e-4,1e-4,1e-4]' 或 '[1, 2, 3]'"""
-    import ast
-    try:
-        # 尝试使用 ast.literal_eval 安全地解析字符串
-        parsed_value = ast.literal_eval(value_str)
-        return parsed_value
-    except (ValueError, SyntaxError):
-        # 如果解析失败，返回原始字符串
-        return value_str
-
 def add_argument(parser, name, value):
     """Helper function to add an argument to the parser if it doesn't already exist."""
     if not any(arg.dest == name for arg in parser._actions):
         if isinstance(value, bool):
             parser.add_argument(f'--{name}', action='store_false' if value else 'store_true', default=value)
-        elif isinstance(value, list):
-            # 对于列表类型，使用自定义的解析函数
-            parser.add_argument(f'--{name}', type=parse_list_arg, default=value)
         else:
             parser.add_argument(f'--{name}', type=type(value), default=value)
 
@@ -301,9 +286,12 @@ def init_args():
         args.epochs = 2
         args.n_folds = 1
         args.wandb_mode = 'disabled'
+
+        if hasattr(args, 'n_tasks'):
+            args.n_tasks = 2
     elif args.debug == 'full':
-        args.n_batches = 20
-        args.epochs = 3
+        args.n_batches = 10
+        args.epochs = 5
         args.wandb_mode = 'disabled'
 
 
@@ -407,7 +395,7 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         idx = torch.cat((top_p_ids, rand_ids))
     elif method=="adaptive":
         pass
-    elif method=="kibo":
+    elif method=="bilevel":
         # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
         # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
         # size = size // 2
@@ -416,22 +404,49 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         for param in proxy_model.parameters():
             param.requires_grad = True
 
+        # 初始化 BCSR 核心集选择器，使用双层优化进行智能样本选择
+        # 参数说明:
+        #   - lr_proxy_model=10: 代理模型学习率
+        #   - beta=0.1: 正则化强度
+        #   - out_dim=100: 输出特征维度
+        #   - max_outer_it=5: 外层优化迭代次数
+        #   - max_inner_it=1: 内层优化迭代次数
+        #   - weight_lr=10: 选择权重学习率
+        #   - candidate_batch_size=600: 候选样本批次大小
+        #   - logging_period=1000: 日志记录周期
         BCSR_Coreset_selector = BCSR_Coreset(
-                            proxy_model,
-                            lr_proxy_model=args.bcsr_lr_proxy_model,
-                            beta=args.bcsr_beta,
-                            out_dim=args.bcsr_out_dim,
-                            max_outer_it=args.bcsr_max_outer_it,
-                            max_inner_it=args.bcsr_max_inner_it,
-                            weight_lr=args.bcsr_weight_lr,
-                            candidate_batch_size=args.bcsr_candidate_batch_size,
-                            logging_period=args.bcsr_logging_period,
-                            distall_lamda=args.distall_lamda,
-                            draw_curve=args.draw_curve)
-        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
-                                                 topk=args.buffer_size, out_loss=None,seen_classes=seen_classes)
+            proxy_model,
+            lr_proxy_model=10,
+            beta=0.1,
+            out_dim=100,
+            max_outer_it=5,
+            max_inner_it=1,
+            weight_lr=10,
+            candidate_batch_size=size,
+            logging_period=1000
+        )
 
-        idx=idx.cpu()
+        # 执行核心集选择：从所有 patches 中选择最具代表性的子集
+        # 输入参数:
+        #   - proxy_model: 代理模型
+        #   - slide: 特征矩阵 (所有patches)
+        #   - label: 样本标签
+        #   - task_id: 任务ID
+        #   - topk: 选择的样本数量
+        #   - seen_classes: 已见过的类别
+        # 返回结果:
+        #   - pick: 选中的样本索引
+        #   - outer_loss: 外层优化损失
+        pick, outer_loss = BCSR_Coreset_selector.coreset_select(
+            proxy_model,
+            slide.cpu().numpy(),
+            label.cpu().numpy(),
+            task_id=task_id,
+            topk=args.buffer_size,
+            out_loss=None,
+            seen_classes=seen_classes
+        )
+
         # top_p_ids = torch.topk(attn, size)[1][-1]
         # top_n_ids = torch.topk(-attn, size, dim=1)[1][-1]
         # idx = torch.cat((top_p_ids, top_n_ids))
@@ -448,6 +463,14 @@ def one_fold(args, fold=0):
     # 设置分布式训练框架和随机种子
     fabric = Fabric(devices=1, accelerator="auto")
     seed_everything(args.seed)
+
+    # 初始化 TensorBoard writer
+    tb_log_dir = f'logs/{args.exp_name}/fold_{fold}/tensorboard'
+    writer = SummaryWriter(log_dir=tb_log_dir)
+
+
+    # 初始化全局 epoch 计数器
+    global_epoch = 0
 
     # 加载并初始化模型
     model = load_model(args)
@@ -481,9 +504,9 @@ def one_fold(args, fold=0):
         torch.cuda.empty_cache()
 
         # 清理之前的日志文件，设置当前任务的日志记录器
-        if os.path.exists(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv'):
-            os.remove(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv')
-        logger = CSVLogger(root_dir=f'{args.log_dir}', name=f'{args.exp_name}', version=f'fold_{fold}_task_{task}')
+        if os.path.exists(f'logs/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv'):
+            os.remove(f'logs/{args.exp_name}/fold_{fold}_task_{task}/metrics.csv')
+        logger = CSVLogger(root_dir=f'logs', name=f'{args.exp_name}', version=f'fold_{fold}_task_{task}')
 
         # ====== 2.2 数据准备和类别管理块 ======
         # 获取当前任务的数据模块（包含训练、验证、测试数据）
@@ -555,6 +578,7 @@ def one_fold(args, fold=0):
             train_loss_metric = MeanMetric()
             val_loss_metric = MeanMetric()
 
+
             # 根据分类任务类型初始化准确率计算器
             if args.n_classes == 2:
                 val_acc_metric = fabric.to_device(Accuracy(task='binary'))
@@ -572,7 +596,7 @@ def one_fold(args, fold=0):
 
                 # 准备日志记录和梯度清零
                 logger_batch = {'epoch': i, 'batch': batch_idx}
-                # print(batch['features'].shape)
+                print(batch['features'].shape)
                 optimizer.zero_grad()
                 batch = fabric.to_device(batch)
 
@@ -612,6 +636,7 @@ def one_fold(args, fold=0):
 
                     # 更新训练损失并记录
                     train_loss_metric.update(loss.item())
+
                     logger_batch.update({'loss': loss.item()})
                     logger.log_metrics(logger_batch)
 
@@ -652,6 +677,7 @@ def one_fold(args, fold=0):
 
                     # 更新训练损失并记录
                     train_loss_metric.update(loss.item())
+
                     logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item(), 'loss': loss.item()})
                     logger.log_metrics(logger_batch)
                 else:
@@ -731,6 +757,7 @@ def one_fold(args, fold=0):
                             inst_loss = out['instance_loss']
                             loss = 0.7*bag_loss + 0.3*inst_loss
                             logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item()})
+
 
                             if hasattr(args, 'cl_method'):
                                 if args.cl_method == 'LwF' and task > 0:
@@ -832,7 +859,23 @@ def one_fold(args, fold=0):
                 val_loss_metric.reset()
                 val_acc_metric.reset()
                 # val_auc_metric.reset()
-                logger.log_metrics({'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss, 'val_acc_epoch': val_acc})
+
+                # CSV 日志记录
+                log_dict = {'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss, 'val_acc_epoch': val_acc}
+
+
+                logger.log_metrics(log_dict)
+
+                # TensorBoard 记录 - 任务独立视图
+                writer.add_scalar(f'task_{task}/train_loss_epoch', train_loss, i)
+                writer.add_scalar(f'task_{task}/val_loss_epoch', val_loss, i)
+                writer.add_scalar(f'task_{task}/val_acc_epoch', val_acc, i)
+
+                # TensorBoard 记录 - 连续视图
+                writer.add_scalar('continuous/train_loss_epoch', train_loss, global_epoch)
+                writer.add_scalar('continuous/val_loss_epoch', val_loss, global_epoch)
+                writer.add_scalar('continuous/val_acc_epoch', val_acc, global_epoch)
+
             else:
                 train_loss = train_loss_metric.compute().item()
                 val_loss = val_loss_metric.compute().item()
@@ -842,24 +885,35 @@ def one_fold(args, fold=0):
                 val_loss_metric.reset()
                 logger.log_metrics({'epoch': i, 'train_loss_epoch': train_loss, 'val_loss_epoch': val_loss})
 
+                # TensorBoard 记录 - 任务独立视图
+                writer.add_scalar(f'task_{task}/train_loss_epoch', train_loss, i)
+                writer.add_scalar(f'task_{task}/val_loss_epoch', val_loss, i)
+
+                # TensorBoard 记录 - 连续视图
+                writer.add_scalar('continuous/train_loss_epoch', train_loss, global_epoch)
+                writer.add_scalar('continuous/val_loss_epoch', val_loss, global_epoch)
+
             # ====== 3.4 早停机制检查 ======
             if args.early_stop:
                 early_stop(i, val_loss)
                 # 如果当前验证损失最小，保存模型
                 if early_stop.val_loss_min == val_loss:
-                    torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt')
+                    torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt')
                 # 检查是否满足早停条件
                 if early_stop.early_stop:
                     print("Early stopping")
                     break
 
+            # 增加全局 epoch 计数器
+            global_epoch += 1
+
         # ====== 4. 模型保存和加载最佳权重 ======
         # 如果没有使用早停，在训练结束后保存模型
         if not args.early_stop:
-            torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt')
+            torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt')
 
         # 加载最佳模型权重并切换到评估模式
-        model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}.pt'))
+        model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_task_{task}.pt'))
         model.eval()
         torch.cuda.empty_cache()
 
@@ -936,17 +990,17 @@ def one_fold(args, fold=0):
             print(f'Number of patches in buffer: {buffer.n_patches_total}')
             print(f'Labels in buffer: {buffer.labels}')
             # 保存缓冲区类别分布到CSV文件
-            with open(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
+            with open(f'logs/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
 
-            # 结束监控并记录
+            # 结束监控并记录到 TensorBoard
             buffer_end_time = time.time()
             buffer_duration = buffer_end_time - buffer_start_time
             buffer_peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
 
-            print(f'Buffer selection duration: {buffer_duration:.2f} seconds')
-            print(f'Buffer selection peak memory: {buffer_peak_memory:.2f} MB')
+            writer.add_scalar('buffer_selection/peak_memory_mb', buffer_peak_memory, task)
+            writer.add_scalar('buffer_selection/duration_seconds', buffer_duration, task)
 
             logger.log_metrics({'buffer_size': len(buffer), 'n_patches_in_buffer': buffer.n_patches_total,
                               'buffer_selection_duration_seconds': buffer_duration,
@@ -1011,12 +1065,15 @@ def one_fold(args, fold=0):
         results.append(result)
         # 将结果保存到CSV文件
         df = pd.DataFrame(results)
-        df.to_csv(f'{args.log_dir}/{args.exp_name}/fold_{fold}_results.csv', index=False)
+        df.to_csv(f'logs/{args.exp_name}/fold_{fold}_results.csv', index=False)
 
         # 记录任务完成状态
         logger.finalize(f"Success on fold {fold} task {task}!")
 
-    # ====== 8. 返回所有任务的测试结果 ======
+    # ====== 8. 清理 TensorBoard writer ======
+    writer.close()
+
+    # ====== 9. 返回所有任务的测试结果 ======
     return results # [{'fold': 0, 'task': 0, '0_auc': 0.9, '0_acc': 0.8}, {...}, ...]
 
 
@@ -1043,8 +1100,8 @@ def one_fold_jt(args, fold=0):
     # model, optimizer = fabric.setup(model, optimizer)
     # train_loader, val_loader = fabric.setup_dataloaders(datamodule['train_loader'], datamodule['val_loader'])
     train_loader, val_loader = datamodule['train_loader'], datamodule['val_loader']
-
-    logger = CSVLogger(root_dir=f'{args.log_dir}', name=f'{args.exp_name}', version=f'fold_{fold}_JT')
+    
+    logger = CSVLogger(root_dir=f'logs', name=f'{args.exp_name}', version=f'fold_{fold}_JT')
 
     # Fitting
     if isinstance(args.epochs, list):
@@ -1157,14 +1214,14 @@ def one_fold_jt(args, fold=0):
         if args.early_stop:
             early_stop(i, val_loss)
             if early_stop.val_loss_min == val_loss:
-                torch.save(model.state_dict(), f'{args.log_dir}/{args.exp_name}/fold_{fold}_JT.pt')
+                torch.save(model.state_dict(), f'logs/{args.exp_name}/fold_{fold}_JT.pt')
             if early_stop.early_stop:
                 print("Early stopping")
                 break
 
     del train_loader, val_loader, optimizer
     # testing, log acc and auc
-    model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_JT.pt'))
+    model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_JT.pt'))
     model.eval()
 
     if args.n_classes == 2:
@@ -1211,7 +1268,7 @@ def one_fold_jt(args, fold=0):
 
     print(result)
     df = pd.DataFrame(result, index=[0])
-    df.to_csv(f'{args.log_dir}/{args.exp_name}/fold_{fold}_results_JT.csv', index=False)
+    df.to_csv(f'logs/{args.exp_name}/fold_{fold}_results_JT.csv', index=False)
     logger.finalize(f"Success on fold {fold}!")
     return result
 
@@ -1230,7 +1287,7 @@ def test_on_one_fold(args, fold=0):
         if args.load is not None:
             model.load_state_dict(torch.load(args.load))
         else:
-            model.load_state_dict(torch.load(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{model_idx}.pt'))
+            model.load_state_dict(torch.load(f'logs/{args.exp_name}/fold_{fold}_task_{model_idx}.pt'))
         model = fabric.to_device(model)
         model.eval()
 
@@ -1305,13 +1362,13 @@ def test(args):
 
     # convert to csv
     df = pd.DataFrame(results)
-    log_path = f'{args.log_dir}/{args.exp_name}'
+    log_path = f'logs/{args.exp_name}'
     if not os.path.exists(log_path):
         os.makedirs(log_path)
     df.to_csv(f'{log_path}/test_results.csv', index=False)
 
 def main(args):
-    log_path = f'{args.log_dir}/{args.exp_name}'
+    log_path = f'logs/{args.exp_name}'
     if not os.path.exists(log_path): # log文件
         os.makedirs(log_path)
     # save args to yaml
@@ -1331,46 +1388,6 @@ def main(args):
     df = pd.DataFrame(results)
     df.to_csv(f'{log_path}/results.csv', index=False)
 
-    # ====== 计算并打印持续学习指标 ======
-    if 'jt' not in args.dataset and (not hasattr(args, 'cl_method') or args.cl_method != 'joint'):
-        # 只在持续学习场景下计算指标（非联合训练）
-        print("\n计算持续学习指标...")
-
-        # 计算所有 fold 的指标
-        cl_metrics = compute_all_folds_metrics(results, joint_accuracies_dict=None, verbose=False)
-
-        # 确定模型名称
-        model_name_map = {
-            'clam_sb': 'CLAM-SB',
-            'clam_mb': 'CLAM-MB',
-            'transmil': 'TransMIL'
-        }
-        model_name = model_name_map.get(args.net, args.net.upper())
-
-        # 打印表格
-        method_name = getattr(args, 'cl_method', 'Ours').upper()
-        print_cl_metrics_table(cl_metrics, method_name=method_name, model_name=model_name)
-
-        # 保存指标到文件
-        metrics_df = pd.DataFrame({
-            'Method': [method_name],
-            'Model': [model_name],
-            'AACC_mean': [cl_metrics['mean']['AACC']],
-            'AACC_std': [cl_metrics['std']['AACC']],
-            'BWT_mean': [cl_metrics['mean']['BWT']],
-            'BWT_std': [cl_metrics['std']['BWT']],
-            'IM_mean': [cl_metrics['mean']['IM']],
-            'IM_std': [cl_metrics['std']['IM']]
-        })
-        metrics_df.to_csv(f'{log_path}/cl_metrics.csv', index=False)
-        print(f"持续学习指标已保存到: {log_path}/cl_metrics.csv\n")
-
-        # 返回 AACC 均值
-        return cl_metrics['mean']['AACC']
-
-    return None
-    
-    
 if __name__ == '__main__':
     args = init_args()
 
