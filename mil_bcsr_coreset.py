@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from mil_bcsr_training import Training
-
+import copy
 
 class BCSR_Coreset:
     """"
@@ -18,7 +18,7 @@ class BCSR_Coreset:
         candidate_batch_size: number of coreset candidates
     """
     def __init__(self, proxy_model, lr_proxy_model,  beta, out_dim=10, max_outer_it=50, max_inner_it=1, weight_lr=1e-1,
-                candidate_batch_size=600, logging_period=1000, device='cuda'):
+                candidate_batch_size=600, logging_period=1000, device='cuda',distall_lamda=0.1,draw_curve=False):
         self.out_dim = out_dim
         self.max_outer_it = max_outer_it
         self.max_inner_it = max_inner_it
@@ -30,7 +30,10 @@ class BCSR_Coreset:
         self.param_size=  []
         self.seed = 0
         self.lr_proxy_model = lr_proxy_model
-        self.training_model_op = Training(proxy_model, beta, device, lr_proxy_model, lr_weights=self.weight_lr)
+        self.training_model_op = Training(proxy_model, beta, device, lr_proxy_model, lr_weights=self.weight_lr,distall_lamda=distall_lamda,draw_curve=draw_curve)
+        self.training_model_op.origin_model=copy.deepcopy(proxy_model)
+        
+        
         for p in self.training_model_op.proxy_model.parameters():
             self.param_size.append(p.size())
 
@@ -68,12 +71,14 @@ class BCSR_Coreset:
         if isinstance(X, np.ndarray):
             X = torch.from_numpy(X).float()
         n = X.shape[0]
+        topk=min(topk, n)
         self.training_model_op.proxy_model.load_state_dict(model.state_dict())
+        self.training_model_op.origin_model.load_state_dict(model.state_dict())
         
-        # initialize sample weights
-        coreset_weights = 1.0/n*torch.ones([n], dtype=torch.float, requires_grad=True)
+        # initialize sample weights from uniform distribution
+        coreset_weights = torch.rand([n], dtype=torch.float, requires_grad=True)
         # project sample weights onto simplex
-        coreset_weights = self.projection_onto_simplex(coreset_weights)
+        # coreset_weights = self.projection_onto_simplex(coreset_weights) # origin
 
         self.training_model_op.lr_p = self.lr_proxy_model # 学习率
         self.training_model_op.lr_w = self.weight_lr # 学习率
@@ -82,11 +87,11 @@ class BCSR_Coreset:
         for i in range(self.max_outer_it):
             inner_loss = self.training_model_op.train_inner(X, y, task_id, coreset_weights, self.max_inner_it,seen_classes=seen_classes)
             coreset_weights, _, outer_loss = self.training_model_op.train_outer(X, y, task_id, coreset_weights, topk, ref_x, ref_y,seen_classes=seen_classes)
-            coreset_weights = self.projection_onto_simplex(coreset_weights)
+            # coreset_weights = self.projection_onto_simplex(coreset_weights)
             total_loss = torch.mean(outer_loss).item()
         print('inner loss:{:.3f}, outer loss:{:.3f}'.format(inner_loss.item(), total_loss))
         if out_loss != None and n==50:
             out_loss.append(total_loss)
 
 
-        return torch.multinomial(coreset_weights, topk, replacement=False), out_loss
+        return torch.topk(coreset_weights, topk).indices, out_loss

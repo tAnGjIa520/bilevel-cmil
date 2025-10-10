@@ -1,0 +1,20 @@
+{
+  "gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "max_jobs_per_gpu": 1,
+  "param_name": "lr",
+  "param_values": [
+    "[1e-4,1e-4,1e-4]",
+    "[1e-5,1e-5,1e-5]",
+    "[5e-5,5e-5,5e-5]"
+  ],
+  "base_config": "configs/csc_clam_cl_debug.yaml",
+  "extra_args": null,
+  "exp_name_prefix": "hyperparam_search",
+  "log_dir": "hyperparam_search_logs",
+  "total_jobs": 3
+}

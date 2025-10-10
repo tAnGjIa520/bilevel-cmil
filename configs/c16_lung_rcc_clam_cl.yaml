@@ -48,7 +48,7 @@ folds_start: -1
 folds_end: -1
 
 # cl setting
-cl_method: 'none' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
+cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
 buffer_size: -1 # 84
 buffer_balance: True
 buffer_slide_size: 0.05 # n_patches in a pseudo slide
@@ -65,3 +65,5 @@ bcsr_max_inner_it: 1  # maximum inner iterations
 bcsr_weight_lr: 10  # weight learning rate
 bcsr_candidate_batch_size: 600  # candidate batch size
 bcsr_logging_period: 1000  # logging period
+distall_lamda : 0.1
+draw_curve : False

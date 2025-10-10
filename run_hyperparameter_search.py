@@ -1,0 +1,684 @@
+#!/usr/bin/env python
+"""
+通用超参数搜索脚本
+支持对任意超参数进行网格搜索，多GPU并行运行，自动分配CUDA设备
+
+使用示例:
+    # 搜索标量参数（buffer_size）
+    python run_hyperparameter_search.py --param-name buffer_size --param-values "32;64;128"
+
+    # 搜索学习率（单值）
+    python run_hyperparameter_search.py --param-name lr --param-values "1e-4;1e-5;1e-6"
+
+    # 搜索学习率（列表，每个任务的学习率）
+    python run_hyperparameter_search.py --param-name lr \
+        --param-values "[1e-4,1e-4,1e-4];[1e-5,1e-5,1e-5];[1e-6,1e-6,1e-6]"
+
+    # 搜索多个seed
+    python run_hyperparameter_search.py --param-name seed --param-values "1;2;3;4;5"
+
+注意：
+    - 超参数值用分号(;)分隔，这样可以支持列表类型的参数（列表内部用逗号）
+    - 对于列表参数，整个列表要用引号包裹，例如 "[1e-4,1e-4,1e-4]"
+"""
+
+import subprocess
+import time
+import argparse
+from pathlib import Path
+from typing import List, Dict, Optional
+import json
+from datetime import datetime
+import pandas as pd
+import os
+
+
+class GPUScheduler:
+    """GPU任务调度器"""
+
+    def __init__(self, gpu_ids: List[int], max_jobs_per_gpu: int = 1):
+        """
+        初始化GPU调度器
+
+        Args:
+            gpu_ids: 可用的GPU ID列表，例如 [0, 1, 2, 3]
+            max_jobs_per_gpu: 每个GPU上最多并行运行的任务数
+        """
+        self.gpu_ids = gpu_ids
+        self.max_jobs_per_gpu = max_jobs_per_gpu
+        # 记录每个GPU上当前运行的任务数
+        self.gpu_jobs = {gpu_id: 0 for gpu_id in gpu_ids}
+        # 记录所有运行中的进程
+        self.running_processes: List[Dict] = []
+        # 记录所有完成的任务结果
+        self.completed_jobs: List[Dict] = []
+
+    def get_available_gpu(self) -> int:
+        """获取一个可用的GPU ID"""
+        # 找到任务数最少的GPU
+        min_jobs = min(self.gpu_jobs.values())
+        if min_jobs >= self.max_jobs_per_gpu:
+            return None  # 所有GPU都满了
+
+        # 返回第一个任务数最少的GPU
+        for gpu_id in self.gpu_ids:
+            if self.gpu_jobs[gpu_id] == min_jobs:
+                return gpu_id
+        return None
+
+    def submit_job(self, gpu_id: int, cmd: List[str], job_name: str, param_value: str, exp_name: str, log_dir: str):
+        """
+        在指定GPU上提交任务
+
+        Args:
+            gpu_id: GPU ID
+            cmd: 命令列表
+            job_name: 任务名称
+            param_value: 当前超参数值
+            exp_name: 实验名称
+            log_dir: 日志目录
+        """
+        # 设置环境变量指定GPU
+        env = os.environ.copy()
+        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+        # 创建任务日志目录
+        task_log_dir = Path(log_dir) / exp_name
+        task_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建任务日志文件
+        log_file_path = task_log_dir / f"run.log"
+        log_file = open(log_file_path, 'w', buffering=1)  # 行缓冲
+
+        # 启动进程，输出重定向到日志文件
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,  # 将stderr也重定向到stdout
+            text=True
+        )
+
+        # 记录任务信息
+        job_info = {
+            'process': process,
+            'gpu_id': gpu_id,
+            'cmd': ' '.join(cmd),
+            'job_name': job_name,
+            'param_value': param_value,
+            'exp_name': exp_name,
+            'log_dir': log_dir,
+            'log_file': log_file,
+            'log_file_path': str(log_file_path),
+            'start_time': time.time()
+        }
+        self.running_processes.append(job_info)
+        self.gpu_jobs[gpu_id] += 1
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动任务: {job_name}")
+        print(f"  - GPU: {gpu_id}")
+        print(f"  - 日志文件: {log_file_path}")
+        print(f"  - 命令:")
+        print(f"    CUDA_VISIBLE_DEVICES={gpu_id} {' '.join(cmd)}")
+        print()
+
+        return process
+
+    def extract_results_from_logs(self, log_dir: str, exp_name: str) -> Optional[Dict]:
+        """
+        从日志文件中提取结果
+
+        Args:
+            log_dir: 日志根目录
+            exp_name: 实验名称
+
+        Returns:
+            包含准确率的字典，如果提取失败则返回None
+        """
+        results = {}
+
+        # 尝试读取 cl_metrics.csv 文件（优先，包含AACC）
+        cl_metrics_csv = Path(log_dir) / exp_name / 'cl_metrics.csv'
+        if cl_metrics_csv.exists():
+            try:
+                df = pd.read_csv(cl_metrics_csv)
+                if 'AACC_mean' in df.columns:
+                    results['AACC'] = df['AACC_mean'].iloc[0] if len(df) > 0 else None
+                if 'BWT_mean' in df.columns:
+                    results['BWT'] = df['BWT_mean'].iloc[0] if len(df) > 0 else None
+                if 'IM_mean' in df.columns:
+                    results['IM'] = df['IM_mean'].iloc[0] if len(df) > 0 else None
+                return results
+            except Exception as e:
+                print(f"    警告: 无法读取 {cl_metrics_csv}: {e}")
+
+        # 尝试读取 results.csv 文件（备用）
+        results_csv = Path(log_dir) / exp_name / 'results.csv'
+        if results_csv.exists():
+            try:
+                df = pd.read_csv(results_csv)
+                # 提取所有 acc 列
+                acc_cols = [col for col in df.columns if 'acc' in col.lower()]
+                for col in acc_cols:
+                    # 取最后一行（最终任务）的值
+                    results[col] = df[col].iloc[-1] if len(df) > 0 else None
+
+                # 计算平均准确率
+                if acc_cols:
+                    valid_accs = [results[col] for col in acc_cols if results[col] is not None]
+                    if valid_accs:
+                        results['avg_acc'] = sum(valid_accs) / len(valid_accs)
+
+                return results
+            except Exception as e:
+                print(f"    警告: 无法读取 {results_csv}: {e}")
+                return None
+
+        return None
+
+    def check_and_clean_finished(self):
+        """检查并清理已完成的任务"""
+        finished_jobs = []
+
+        for job_info in self.running_processes:
+            process = job_info['process']
+            if process.poll() is not None:  # 进程已结束
+                finished_jobs.append(job_info)
+
+                # 关闭日志文件
+                if 'log_file' in job_info and job_info['log_file']:
+                    try:
+                        job_info['log_file'].close()
+                    except Exception as e:
+                        print(f"警告: 关闭日志文件失败: {e}")
+
+                # 释放GPU资源
+                gpu_id = job_info['gpu_id']
+                self.gpu_jobs[gpu_id] -= 1
+
+                # 计算运行时间
+                elapsed = time.time() - job_info['start_time']
+
+                # 检查返回码
+                success = process.returncode == 0
+
+                if success:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ 任务完成: {job_info['job_name']}")
+
+                    # 尝试提取结果
+                    results = self.extract_results_from_logs(
+                        job_info['log_dir'],
+                        job_info['exp_name']
+                    )
+
+                    if results and 'AACC' in results:
+                        print(f"  - AACC: {results['AACC']:.4f}")
+                    elif results and 'avg_acc' in results:
+                        print(f"  - 平均准确率: {results['avg_acc']:.4f}")
+                    else:
+                        print(f"  - 警告: 无法提取准确率")
+                        results = {'error': 'Failed to extract results'}
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ 任务失败: {job_info['job_name']} (返回码: {process.returncode})")
+                    results = {'error': f'Process failed with code {process.returncode}'}
+
+                print(f"  - 运行时间: {elapsed/60:.1f} 分钟")
+                print(f"  - GPU {gpu_id} 释放")
+                if 'log_file_path' in job_info:
+                    print(f"  - 日志文件: {job_info['log_file_path']}")
+                print()
+
+                # 保存完成的任务信息
+                completed_info = {
+                    'param_value': job_info['param_value'],
+                    'exp_name': job_info['exp_name'],
+                    'job_name': job_info['job_name'],
+                    'gpu_id': gpu_id,
+                    'elapsed_time': elapsed,
+                    'success': success,
+                    'results': results
+                }
+                if 'log_file_path' in job_info:
+                    completed_info['log_file_path'] = job_info['log_file_path']
+                self.completed_jobs.append(completed_info)
+
+        # 从运行列表中移除已完成的任务
+        for job in finished_jobs:
+            self.running_processes.remove(job)
+
+    def wait_for_slot(self, check_interval: float = 5.0):
+        """等待直到有可用的GPU槽位"""
+        while True:
+            self.check_and_clean_finished()
+            gpu_id = self.get_available_gpu()
+            if gpu_id is not None:
+                return gpu_id
+            time.sleep(check_interval)
+
+    def wait_all_jobs(self, check_interval: float = 5.0):
+        """等待所有任务完成"""
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 等待所有任务完成...")
+        while self.running_processes:
+            self.check_and_clean_finished()
+            time.sleep(check_interval)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 所有任务已完成！")
+
+    def print_summary_table(self, param_name: str):
+        """打印汇总表格
+
+        Args:
+            param_name: 超参数名称
+        """
+        if not self.completed_jobs:
+            print("没有完成的任务")
+            return
+
+        print("\n" + "=" * 100)
+        print(f"实验结果汇总 - {param_name}")
+        print("=" * 100)
+
+        # 准备表格数据
+        table_data = []
+        for job in sorted(self.completed_jobs, key=lambda x: str(x['param_value'])):
+            row = {
+                param_name: job['param_value'],
+                'Status': '✓' if job['success'] else '✗',
+                'Time(min)': f"{job['elapsed_time']/60:.1f}",
+            }
+
+            # 添加准确率信息
+            if job['success'] and 'results' in job and job['results']:
+                results = job['results']
+                if 'error' not in results:
+                    # 优先显示AACC
+                    if 'AACC' in results and results['AACC'] is not None:
+                        row['AACC'] = f"{results['AACC']:.4f}"
+                    # 然后显示其他指标
+                    for key in ['BWT', 'IM']:
+                        if key in results and results[key] is not None:
+                            row[key] = f"{results[key]:.4f}"
+                    # 显示其他acc列
+                    for key, value in results.items():
+                        if key not in ['AACC', 'BWT', 'IM'] and 'acc' in key.lower() and value is not None:
+                            row[key] = f"{value:.4f}"
+                else:
+                    row['Error'] = results['error']
+            else:
+                row['Error'] = 'N/A'
+
+            table_data.append(row)
+
+        # 使用pandas打印表格
+        if table_data:
+            df = pd.DataFrame(table_data)
+            print("\n" + df.to_string(index=False))
+
+            # 计算统计信息
+            print("\n" + "=" * 100)
+            print("统计信息")
+            print("=" * 100)
+
+            successful_jobs = [j for j in self.completed_jobs if j['success']]
+            print(f"成功任务数: {len(successful_jobs)}/{len(self.completed_jobs)}")
+
+            if successful_jobs:
+                # 优先计算AACC统计信息
+                aaccs = []
+                for job in successful_jobs:
+                    if 'results' in job and job['results'] and 'AACC' in job['results']:
+                        aaccs.append(job['results']['AACC'])
+
+                if aaccs:
+                    print(f"\nAACC 统计:")
+                    print(f"  - Mean: {sum(aaccs)/len(aaccs):.4f}")
+                    print(f"  - Std:  {pd.Series(aaccs).std():.4f}")
+                    print(f"  - Max:  {max(aaccs):.4f}")
+                    print(f"  - Min:  {min(aaccs):.4f}")
+                else:
+                    # 备选：计算平均准确率
+                    avg_accs = []
+                    for job in successful_jobs:
+                        if 'results' in job and job['results'] and 'avg_acc' in job['results']:
+                            avg_accs.append(job['results']['avg_acc'])
+
+                    if avg_accs:
+                        print(f"\n平均准确率:")
+                        print(f"  - Mean: {sum(avg_accs)/len(avg_accs):.4f}")
+                        print(f"  - Std:  {pd.Series(avg_accs).std():.4f}")
+                        print(f"  - Max:  {max(avg_accs):.4f}")
+                        print(f"  - Min:  {min(avg_accs):.4f}")
+
+                # 平均运行时间
+                avg_time = sum(j['elapsed_time'] for j in successful_jobs) / len(successful_jobs)
+                print(f"\n平均运行时间: {avg_time/60:.1f} 分钟")
+
+        print("\n" + "=" * 100)
+
+    def save_results(self, param_name: str, log_dir: str):
+        """保存结果到CSV文件并同时保存汇总文件
+
+        Args:
+            param_name: 超参数名称
+        """
+        if not self.completed_jobs:
+            return
+
+        # 准备表格数据
+        table_data = []
+        for job in sorted(self.completed_jobs, key=lambda x: str(x['param_value'])):
+            row = {
+                param_name: job['param_value'],
+                'Status': 'Success' if job['success'] else 'Failed',
+                'Time(min)': job['elapsed_time']/60,  # 保持数值格式
+            }
+
+            # 添加准确率信息
+            if job['success'] and 'results' in job and job['results']:
+                results = job['results']
+                if 'error' not in results:
+                    # 优先添加AACC
+                    if 'AACC' in results and results['AACC'] is not None:
+                        row['AACC'] = results['AACC']
+                    # 然后添加其他指标
+                    for key in ['BWT', 'IM']:
+                        if key in results and results[key] is not None:
+                            row[key] = results[key]
+                    # 添加其他acc列
+                    for key, value in results.items():
+                        if key not in ['AACC', 'BWT', 'IM'] and 'acc' in key.lower() and value is not None:
+                            row[key] = value
+                else:
+                    row['Error'] = results['error']
+            else:
+                row['Error'] = 'N/A'
+
+            table_data.append(row)
+
+        # 保存结果到CSV
+        if table_data:
+            os.makedirs(log_dir, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            results_file = os.path.join(log_dir, f"hyperparam_search_{param_name}_{timestamp}.csv")
+            df = pd.DataFrame(table_data)
+            df.to_csv(results_file, index=False)
+            print(f"\n详细结果已保存到: {results_file}")
+
+            # 另外保存一个汇总文件，包含 param_value、AACC、BWT、IM
+            successful_jobs = [j for j in self.completed_jobs if j['success']]
+            if successful_jobs:
+                summary_data = []
+                aaccs = []
+                bwts = []
+                ims = []
+
+                for job in sorted(successful_jobs, key=lambda x: str(x['param_value'])):
+                    if 'results' in job and job['results']:
+                        row = {param_name: job['param_value']}
+                        if 'AACC' in job['results']:
+                            row['AACC'] = job['results']['AACC']
+                            aaccs.append(job['results']['AACC'])
+                        if 'BWT' in job['results']:
+                            row['BWT'] = job['results']['BWT']
+                            bwts.append(job['results']['BWT'])
+                        if 'IM' in job['results']:
+                            row['IM'] = job['results']['IM']
+                            ims.append(job['results']['IM'])
+
+                        if 'AACC' in row or 'BWT' in row or 'IM' in row:
+                            summary_data.append(row)
+
+                if summary_data:
+                    summary_file = os.path.join(log_dir, f"{param_name}_metrics_summary.txt")
+                    with open(summary_file, 'w') as f:
+                        f.write("=" * 70 + "\n")
+                        f.write(f"超参数搜索结果 - {param_name}\n")
+                        f.write("=" * 70 + "\n\n")
+
+                        # 表头
+                        f.write(f"{param_name:<15} {'AACC':<12} {'BWT':<12} {'IM':<12}\n")
+                        f.write("-" * 51 + "\n")
+
+                        # 数据行
+                        for item in summary_data:
+                            param_str = f"{item[param_name]:<15}"
+                            aacc_str = f"{item.get('AACC', 0):.4f}" if 'AACC' in item else "N/A"
+                            bwt_str = f"{item.get('BWT', 0):.4f}" if 'BWT' in item else "N/A"
+                            im_str = f"{item.get('IM', 0):.4f}" if 'IM' in item else "N/A"
+                            f.write(f"{param_str} {aacc_str:<12} {bwt_str:<12} {im_str:<12}\n")
+
+                        f.write("\n" + "=" * 70 + "\n")
+                        f.write("统计信息（均值 ± 标准差）\n")
+                        f.write("=" * 70 + "\n")
+
+                        # AACC 统计
+                        if aaccs:
+                            mean_aacc = sum(aaccs) / len(aaccs)
+                            std_aacc = pd.Series(aaccs).std()
+                            f.write(f"AACC: {mean_aacc:.4f} ± {std_aacc:.4f}  (Max: {max(aaccs):.4f}, Min: {min(aaccs):.4f})\n")
+
+                        # BWT 统计
+                        if bwts:
+                            mean_bwt = sum(bwts) / len(bwts)
+                            std_bwt = pd.Series(bwts).std()
+                            f.write(f"BWT:  {mean_bwt:.4f} ± {std_bwt:.4f}  (Max: {max(bwts):.4f}, Min: {min(bwts):.4f})\n")
+
+                        # IM 统计
+                        if ims:
+                            mean_im = sum(ims) / len(ims)
+                            std_im = pd.Series(ims).std()
+                            f.write(f"IM:   {mean_im:.4f} ± {std_im:.4f}  (Max: {max(ims):.4f}, Min: {min(ims):.4f})\n")
+
+                        f.write("=" * 70 + "\n")
+
+                    print(f"指标汇总已保存到: {summary_file}")
+
+            print("=" * 100 + "\n")
+
+
+def generate_commands(
+    base_config: str,
+    param_name: str,
+    param_values: List[str],
+    exp_name_prefix: str,
+    log_dir: str,
+    extra_args: Dict[str, str] = None
+) -> List[Dict]:
+    """
+    生成所有实验命令
+
+    Args:
+        base_config: 基础配置文件路径
+        param_name: 要搜索的超参数名称
+        param_values: 超参数值列表
+        exp_name_prefix: 实验名称前缀
+        log_dir: 日志目录
+        extra_args: 额外的命令行参数字典
+
+    Returns:
+        List[Dict]: 包含命令和任务名称的字典列表
+    """
+    commands = []
+
+    for idx, param_value in enumerate(param_values):
+        # 构造实验名称（避免特殊字符，使用索引）
+        # 对于列表参数，使用清理后的字符串
+        safe_value = param_value.replace('[', '').replace(']', '').replace(',', '_').replace(' ', '')
+        exp_name = f"{exp_name_prefix}_{param_name}_{idx}_{safe_value[:30]}"  # 限制长度
+
+        # 基础命令
+        cmd = [
+            "python", "main_cl.py",
+            "--preset", base_config,
+            "--exp_name", exp_name,
+            "--log_dir", log_dir
+        ]
+
+        # 添加要搜索的超参数
+        cmd.extend([f"--{param_name}", str(param_value)])
+
+        # 添加额外的参数
+        if extra_args:
+            for arg_name, arg_value in extra_args.items():
+                cmd.extend([f"--{arg_name}", str(arg_value)])
+
+        commands.append({
+            'cmd': cmd,
+            'job_name': f"{param_name}={param_value}",
+            'param_value': str(param_value),
+            'exp_name': exp_name
+        })
+
+    return commands
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='通用超参数搜索工具',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="""
+使用示例:
+  # 搜索学习率（单值）
+  python run_hyperparameter_search.py --param-name lr --param-values "1e-4;1e-5;1e-6"
+
+  # 搜索学习率（列表，每个任务的学习率）
+  python run_hyperparameter_search.py --param-name lr \\
+      --param-values "[1e-4,1e-4,1e-4];[1e-5,1e-5,1e-5];[1e-6,1e-6,1e-6]"
+
+  # 搜索buffer_size，并指定其他固定参数
+  python run_hyperparameter_search.py --param-name buffer_size --param-values "32;64;128" \\
+      --extra-args "cl_method=prev,seed=42"
+
+  # 搜索多个seed
+  python run_hyperparameter_search.py --param-name seed --param-values "1;2;3;4;5"
+        """
+    )
+
+    # GPU配置
+    parser.add_argument('--gpus', type=str, default='0,1,2,3',
+                        help='可用的GPU ID，用逗号分隔，例如: 0,1,2,3')
+    parser.add_argument('--max-jobs-per-gpu', type=int, default=1,
+                        help='每个GPU上最多并行运行的任务数')
+
+    # 实验配置
+    parser.add_argument('--preset', type=str, default='configs/csc_clam_cl_debug.yaml',
+                        help='配置文件路径')
+    parser.add_argument('--exp-name-prefix', type=str, default='hyperparam_search',
+                        help='实验名称前缀，会自动添加 _paramName_paramValue')
+    parser.add_argument('--log-dir', type=str, default='hyperparam_search_logs',
+                        help='日志根目录')
+
+    # 超参数搜索配置（核心参数）
+    parser.add_argument('--param-name', type=str, required=True,
+                        help='要搜索的超参数名称，例如: lr, buffer_size, seed')
+    parser.add_argument('--param-values', type=str, required=True,
+                        help='超参数值列表，用分号(;)分隔。对于列表类型参数，整个列表用引号包裹。\n'
+                             '示例: "0.001;0.0001;0.00001" 或 "[1e-4,1e-4,1e-4];[1e-5,1e-5,1e-5]"')
+
+    # 额外参数
+    parser.add_argument('--extra-args', type=str, default=None,
+                        help='额外的命令行参数，格式: arg1=value1,arg2=value2，例如: cl_method=prev,seed=42')
+
+    # 其他配置
+    parser.add_argument('--dry-run', action='store_true',
+                        help='只打印命令，不实际运行')
+    parser.add_argument('--check-interval', type=float, default=10.0,
+                        help='检查任务完成的时间间隔（秒）')
+
+    args = parser.parse_args()
+
+    # 解析GPU ID
+    gpu_ids = [int(x.strip()) for x in args.gpus.split(',')]
+    print(f"可用GPU: {gpu_ids}")
+    print(f"每GPU最大任务数: {args.max_jobs_per_gpu}")
+    print()
+
+    # 解析超参数值列表（使用分号分隔以支持列表参数）
+    param_values = [x.strip() for x in args.param_values.split(';')]
+    print(f"搜索的超参数: {args.param_name}")
+    print(f"超参数值: {param_values}")
+    print(f"总任务数: {len(param_values)}")
+    print()
+
+    # 解析额外参数
+    extra_args = None
+    if args.extra_args:
+        extra_args = {}
+        for pair in args.extra_args.split(','):
+            if '=' in pair:
+                key, value = pair.split('=', 1)
+                extra_args[key.strip()] = value.strip()
+        print(f"额外参数: {extra_args}")
+        print()
+
+    # 生成所有命令
+    commands = generate_commands(
+        base_config=args.preset,
+        param_name=args.param_name,
+        param_values=param_values,
+        exp_name_prefix=args.exp_name_prefix,
+        log_dir=args.log_dir,
+        extra_args=extra_args
+    )
+
+    # 确保日志目录存在
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    # 保存实验配置到日志目录
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    config_file = os.path.join(args.log_dir, f"hyperparam_search_{args.param_name}_{timestamp}.json")
+    with open(config_file, 'w') as f:
+        json.dump({
+            'gpus': gpu_ids,
+            'max_jobs_per_gpu': args.max_jobs_per_gpu,
+            'param_name': args.param_name,
+            'param_values': param_values,
+            'base_config': args.preset,
+            'extra_args': extra_args,
+            'exp_name_prefix': args.exp_name_prefix,
+            'log_dir': args.log_dir,
+            'total_jobs': len(commands)
+        }, f, indent=2)
+    print(f"实验配置已保存到: {config_file}\n")
+
+    if args.dry_run:
+        print("=" * 80)
+        print("DRY RUN - 只显示命令，不实际执行")
+        print("=" * 80)
+        for i, cmd_info in enumerate(commands, 1):
+            print(f"\n任务 {i}/{len(commands)}: {cmd_info['job_name']}")
+            print(f"命令: {' '.join(cmd_info['cmd'])}")
+        return
+
+    # 创建GPU调度器
+    scheduler = GPUScheduler(gpu_ids, args.max_jobs_per_gpu)
+
+    print("=" * 80)
+    print("开始执行任务")
+    print("=" * 80)
+    print()
+
+    # 提交所有任务
+    for cmd_info in commands:
+        # 等待可用的GPU槽位
+        gpu_id = scheduler.wait_for_slot(check_interval=args.check_interval)
+
+        # 提交任务
+        scheduler.submit_job(
+            gpu_id=gpu_id,
+            cmd=cmd_info['cmd'],
+            job_name=cmd_info['job_name'],
+            param_value=cmd_info['param_value'],
+            exp_name=cmd_info['exp_name'],
+            log_dir=args.log_dir
+        )
+
+    # 等待所有任务完成
+    scheduler.wait_all_jobs(check_interval=args.check_interval)
+
+    # 打印汇总表格并保存结果
+    scheduler.print_summary_table(param_name=args.param_name)
+    scheduler.save_results(param_name=args.param_name, log_dir=args.log_dir)
+
+
+if __name__ == "__main__":
+    main()

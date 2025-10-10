@@ -1,0 +1,22 @@
+{
+  "gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "max_jobs_per_gpu": 1,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "base_config": "configs/csc_clam_cl_debug.yaml",
+  "cl_method": "prev",
+  "buffer_size": 42,
+  "exp_name_prefix": "csc_clam_cl_debug",
+  "log_dir": "debug_seed_logs",
+  "total_jobs": 5
+}

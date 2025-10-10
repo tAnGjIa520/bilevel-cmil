@@ -20,6 +20,8 @@ import copy
 from collections import defaultdict
 import random
 from mil_bcsr_coreset import BCSR_Coreset
+from tools.cl_metrics import compute_all_folds_metrics
+from tools.print_metrics import print_cl_metrics_table
 
 
 # use pure pytorch instead of pytorch-lightning
@@ -246,11 +248,25 @@ class EarlyStopping:
             self.counter = 0
 
     
+def parse_list_arg(value_str):
+    """解析命令行中的列表参数，例如 '[1e-4,1e-4,1e-4]' 或 '[1, 2, 3]'"""
+    import ast
+    try:
+        # 尝试使用 ast.literal_eval 安全地解析字符串
+        parsed_value = ast.literal_eval(value_str)
+        return parsed_value
+    except (ValueError, SyntaxError):
+        # 如果解析失败，返回原始字符串
+        return value_str
+
 def add_argument(parser, name, value):
     """Helper function to add an argument to the parser if it doesn't already exist."""
     if not any(arg.dest == name for arg in parser._actions):
         if isinstance(value, bool):
             parser.add_argument(f'--{name}', action='store_false' if value else 'store_true', default=value)
+        elif isinstance(value, list):
+            # 对于列表类型，使用自定义的解析函数
+            parser.add_argument(f'--{name}', type=parse_list_arg, default=value)
         else:
             parser.add_argument(f'--{name}', type=type(value), default=value)
 
@@ -284,9 +300,6 @@ def init_args():
         args.epochs = 2
         args.n_folds = 1
         args.wandb_mode = 'disabled'
-
-        if hasattr(args, 'n_tasks'):
-            args.n_tasks = 2
     elif args.debug == 'full':
         args.n_batches = 20
         args.epochs = 3
@@ -393,27 +406,31 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         idx = torch.cat((top_p_ids, rand_ids))
     elif method=="adaptive":
         pass
-    elif method=="bilevel":
+    elif method=="kibo":
         # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
         # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
-        size = size // 2
+        # size = size // 2
         # coreset_select(self, model, X, y, task_id, topk, out_loss=None, ref_x=None, ref_y=None):
         proxy_model=copy.deepcopy(model)
         for param in proxy_model.parameters():
             param.requires_grad = True
 
-        BCSR_Coreset_selector = BCSR_Coreset(proxy_model,
-                          lr_proxy_model=args.bcsr_lr_proxy_model,
-                          beta=args.bcsr_beta,
-                          out_dim=args.bcsr_out_dim,
-                          max_outer_it=args.bcsr_max_outer_it,
-                          max_inner_it=args.bcsr_max_inner_it,
-                          weight_lr=args.bcsr_weight_lr,
-                          candidate_batch_size=args.bcsr_candidate_batch_size,
-                          logging_period=args.bcsr_logging_period)
-        pick, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
+        BCSR_Coreset_selector = BCSR_Coreset(
+                            proxy_model,
+                            lr_proxy_model=args.bcsr_lr_proxy_model,
+                            beta=args.bcsr_beta,
+                            out_dim=args.bcsr_out_dim,
+                            max_outer_it=args.bcsr_max_outer_it,
+                            max_inner_it=args.bcsr_max_inner_it,
+                            weight_lr=args.bcsr_weight_lr,
+                            candidate_batch_size=args.bcsr_candidate_batch_size,
+                            logging_period=args.bcsr_logging_period,
+                            distall_lamda=args.distall_lamda,
+                            draw_curve=args.draw_curve)
+        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
                                                  topk=args.buffer_size, out_loss=None,seen_classes=seen_classes)
 
+        idx=idx.cpu()
         # top_p_ids = torch.topk(attn, size)[1][-1]
         # top_n_ids = torch.topk(-attn, size, dim=1)[1][-1]
         # idx = torch.cat((top_p_ids, top_n_ids))
@@ -554,7 +571,7 @@ def one_fold(args, fold=0):
 
                 # 准备日志记录和梯度清零
                 logger_batch = {'epoch': i, 'batch': batch_idx}
-                print(batch['features'].shape)
+                # print(batch['features'].shape)
                 optimizer.zero_grad()
                 batch = fabric.to_device(batch)
 
@@ -1292,11 +1309,51 @@ def main(args):
             result = one_fold(args, fold=fold)
 
         results.extend(result)
-    
+
     # convert to csv
     df = pd.DataFrame(results)
     df.to_csv(f'{log_path}/results.csv', index=False)
 
+    # ====== 计算并打印持续学习指标 ======
+    if 'jt' not in args.dataset and (not hasattr(args, 'cl_method') or args.cl_method != 'joint'):
+        # 只在持续学习场景下计算指标（非联合训练）
+        print("\n计算持续学习指标...")
+
+        # 计算所有 fold 的指标
+        cl_metrics = compute_all_folds_metrics(results, joint_accuracies_dict=None, verbose=False)
+
+        # 确定模型名称
+        model_name_map = {
+            'clam_sb': 'CLAM-SB',
+            'clam_mb': 'CLAM-MB',
+            'transmil': 'TransMIL'
+        }
+        model_name = model_name_map.get(args.net, args.net.upper())
+
+        # 打印表格
+        method_name = getattr(args, 'cl_method', 'Ours').upper()
+        print_cl_metrics_table(cl_metrics, method_name=method_name, model_name=model_name)
+
+        # 保存指标到文件
+        metrics_df = pd.DataFrame({
+            'Method': [method_name],
+            'Model': [model_name],
+            'AACC_mean': [cl_metrics['mean']['AACC']],
+            'AACC_std': [cl_metrics['std']['AACC']],
+            'BWT_mean': [cl_metrics['mean']['BWT']],
+            'BWT_std': [cl_metrics['std']['BWT']],
+            'IM_mean': [cl_metrics['mean']['IM']],
+            'IM_std': [cl_metrics['std']['IM']]
+        })
+        metrics_df.to_csv(f'{log_path}/cl_metrics.csv', index=False)
+        print(f"持续学习指标已保存到: {log_path}/cl_metrics.csv\n")
+
+        # 返回 AACC 均值
+        return cl_metrics['mean']['AACC']
+
+    return None
+    
+    
 if __name__ == '__main__':
     args = init_args()
 

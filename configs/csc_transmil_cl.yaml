@@ -13,7 +13,7 @@ feature_extractor: null
 
 # dataset setting
 dataset: 'csc_cl'
-data_root: '/root/cmil/MICIL-main/local_data'
+data_root: '/mnt/nfs/zhangjinouwen/tangjia/cmil/bilevel-cmil/data'
 feat_dir: 'embeddings'
 classes_order: ['2', '4', '0', '5', '3', '1']
 n_folds: 1
@@ -38,7 +38,7 @@ folds_start: -1
 folds_end: -1
 
 # cl setting
-cl_method: 'none' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
+cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
 buffer_size: -1 # 84
 buffer_balance: False
 buffer_slide_size: -1 # n_patches in a pseudo slide
@@ -55,3 +55,5 @@ bcsr_max_inner_it: 1  # maximum inner iterations
 bcsr_weight_lr: 10  # weight learning rate
 bcsr_candidate_batch_size: 600  # candidate batch size
 bcsr_logging_period: 1000  # logging period
+distall_lamda : 0.1
+draw_curve : False

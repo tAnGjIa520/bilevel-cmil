@@ -65,12 +65,20 @@ class GPUScheduler:
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
-        # 启动进程
+        # 创建任务日志目录
+        task_log_dir = Path(log_dir) / exp_name
+        task_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建任务日志文件
+        log_file_path = task_log_dir / f"seed_{seed}_run.log"
+        log_file = open(log_file_path, 'w', buffering=1)  # 行缓冲
+
+        # 启动进程，输出重定向到日志文件
         process = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,  # 将stderr也重定向到stdout
             text=True
         )
 
@@ -83,6 +91,8 @@ class GPUScheduler:
             'seed': seed,
             'exp_name': exp_name,
             'log_dir': log_dir,
+            'log_file': log_file,
+            'log_file_path': str(log_file_path),
             'start_time': time.time()
         }
         self.running_processes.append(job_info)
@@ -90,6 +100,7 @@ class GPUScheduler:
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动任务: {job_name}")
         print(f"  - GPU: {gpu_id}")
+        print(f"  - 日志文件: {log_file_path}")
         print(f"  - 命令:")
         print(f"    CUDA_VISIBLE_DEVICES={gpu_id} {' '.join(cmd)}")
         print()
@@ -109,7 +120,22 @@ class GPUScheduler:
         """
         results = {}
 
-        # 尝试读取 results.csv 文件
+        # 尝试读取 cl_metrics.csv 文件（优先，包含AACC）
+        cl_metrics_csv = Path(log_dir) / exp_name / 'cl_metrics.csv'
+        if cl_metrics_csv.exists():
+            try:
+                df = pd.read_csv(cl_metrics_csv)
+                if 'AACC_mean' in df.columns:
+                    results['AACC'] = df['AACC_mean'].iloc[0] if len(df) > 0 else None
+                if 'BWT_mean' in df.columns:
+                    results['BWT'] = df['BWT_mean'].iloc[0] if len(df) > 0 else None
+                if 'IM_mean' in df.columns:
+                    results['IM'] = df['IM_mean'].iloc[0] if len(df) > 0 else None
+                return results
+            except Exception as e:
+                print(f"    警告: 无法读取 {cl_metrics_csv}: {e}")
+
+        # 尝试读取 results.csv 文件（备用）
         results_csv = Path(log_dir) / exp_name / 'results.csv'
         if results_csv.exists():
             try:
@@ -142,6 +168,13 @@ class GPUScheduler:
             if process.poll() is not None:  # 进程已结束
                 finished_jobs.append(job_info)
 
+                # 关闭日志文件
+                if 'log_file' in job_info and job_info['log_file']:
+                    try:
+                        job_info['log_file'].close()
+                    except Exception as e:
+                        print(f"警告: 关闭日志文件失败: {e}")
+
                 # 释放GPU资源
                 gpu_id = job_info['gpu_id']
                 self.gpu_jobs[gpu_id] -= 1
@@ -161,7 +194,9 @@ class GPUScheduler:
                         job_info['exp_name']
                     )
 
-                    if results and 'avg_acc' in results:
+                    if results and 'AACC' in results:
+                        print(f"  - AACC: {results['AACC']:.4f}")
+                    elif results and 'avg_acc' in results:
                         print(f"  - 平均准确率: {results['avg_acc']:.4f}")
                     else:
                         print(f"  - 警告: 无法提取准确率")
@@ -172,6 +207,8 @@ class GPUScheduler:
 
                 print(f"  - 运行时间: {elapsed/60:.1f} 分钟")
                 print(f"  - GPU {gpu_id} 释放")
+                if 'log_file_path' in job_info:
+                    print(f"  - 日志文件: {job_info['log_file_path']}")
                 print()
 
                 # 保存完成的任务信息
@@ -184,6 +221,8 @@ class GPUScheduler:
                     'success': success,
                     'results': results
                 }
+                if 'log_file_path' in job_info:
+                    completed_info['log_file_path'] = job_info['log_file_path']
                 self.completed_jobs.append(completed_info)
 
         # 从运行列表中移除已完成的任务
@@ -230,9 +269,16 @@ class GPUScheduler:
             if job['success'] and 'results' in job and job['results']:
                 results = job['results']
                 if 'error' not in results:
-                    # 提取所有任务的准确率
+                    # 优先显示AACC
+                    if 'AACC' in results and results['AACC'] is not None:
+                        row['AACC'] = f"{results['AACC']:.4f}"
+                    # 然后显示其他指标
+                    for key in ['BWT', 'IM']:
+                        if key in results and results[key] is not None:
+                            row[key] = f"{results[key]:.4f}"
+                    # 显示其他acc列
                     for key, value in results.items():
-                        if 'acc' in key.lower() and value is not None:
+                        if key not in ['AACC', 'BWT', 'IM'] and 'acc' in key.lower() and value is not None:
                             row[key] = f"{value:.4f}"
                 else:
                     row['Error'] = results['error']
@@ -255,18 +301,31 @@ class GPUScheduler:
             print(f"成功任务数: {len(successful_jobs)}/{len(self.completed_jobs)}")
 
             if successful_jobs:
-                # 计算平均准确率
-                avg_accs = []
+                # 优先计算AACC统计信息
+                aaccs = []
                 for job in successful_jobs:
-                    if 'results' in job and job['results'] and 'avg_acc' in job['results']:
-                        avg_accs.append(job['results']['avg_acc'])
+                    if 'results' in job and job['results'] and 'AACC' in job['results']:
+                        aaccs.append(job['results']['AACC'])
 
-                if avg_accs:
-                    print(f"\n平均准确率:")
-                    print(f"  - Mean: {sum(avg_accs)/len(avg_accs):.4f}")
-                    print(f"  - Std:  {pd.Series(avg_accs).std():.4f}")
-                    print(f"  - Max:  {max(avg_accs):.4f}")
-                    print(f"  - Min:  {min(avg_accs):.4f}")
+                if aaccs:
+                    print(f"\nAACC 统计:")
+                    print(f"  - Mean: {sum(aaccs)/len(aaccs):.4f}")
+                    print(f"  - Std:  {pd.Series(aaccs).std():.4f}")
+                    print(f"  - Max:  {max(aaccs):.4f}")
+                    print(f"  - Min:  {min(aaccs):.4f}")
+                else:
+                    # 备选：计算平均准确率
+                    avg_accs = []
+                    for job in successful_jobs:
+                        if 'results' in job and job['results'] and 'avg_acc' in job['results']:
+                            avg_accs.append(job['results']['avg_acc'])
+
+                    if avg_accs:
+                        print(f"\n平均准确率:")
+                        print(f"  - Mean: {sum(avg_accs)/len(avg_accs):.4f}")
+                        print(f"  - Std:  {pd.Series(avg_accs).std():.4f}")
+                        print(f"  - Max:  {max(avg_accs):.4f}")
+                        print(f"  - Min:  {min(avg_accs):.4f}")
 
                 # 平均运行时间
                 avg_time = sum(j['elapsed_time'] for j in successful_jobs) / len(successful_jobs)
@@ -275,7 +334,7 @@ class GPUScheduler:
         print("\n" + "=" * 100)
 
     def save_results(self, log_dir: str):
-        """保存结果到CSV文件"""
+        """保存结果到CSV文件并同时保存汇总文件"""
         if not self.completed_jobs:
             return
 
@@ -285,16 +344,24 @@ class GPUScheduler:
             row = {
                 'Seed': job['seed'],
                 'Status': 'Success' if job['success'] else 'Failed',
-                'Time(min)': f"{job['elapsed_time']/60:.1f}",
+                'Time(min)': job['elapsed_time']/60,  # 保持数值格式
             }
 
             # 添加准确率信息
             if job['success'] and 'results' in job and job['results']:
                 results = job['results']
                 if 'error' not in results:
+                    # 优先添加AACC
+                    if 'AACC' in results and results['AACC'] is not None:
+                        row['AACC'] = results['AACC']
+                    # 然后添加其他指标
+                    for key in ['BWT', 'IM']:
+                        if key in results and results[key] is not None:
+                            row[key] = results[key]
+                    # 添加其他acc列
                     for key, value in results.items():
-                        if 'acc' in key.lower() and value is not None:
-                            row[key] = value  # 保持数值格式，方便后续分析
+                        if key not in ['AACC', 'BWT', 'IM'] and 'acc' in key.lower() and value is not None:
+                            row[key] = value
                 else:
                     row['Error'] = results['error']
             else:
@@ -305,10 +372,81 @@ class GPUScheduler:
         # 保存结果到CSV
         if table_data:
             os.makedirs(log_dir, exist_ok=True)
-            results_file = os.path.join(log_dir, f"seed_search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            results_file = os.path.join(log_dir, f"seed_search_results_{timestamp}.csv")
             df = pd.DataFrame(table_data)
             df.to_csv(results_file, index=False)
-            print(f"\n结果已保存到: {results_file}")
+            print(f"\n详细结果已保存到: {results_file}")
+
+            # 另外保存一个汇总文件，包含 Seed、AACC、BWT、IM
+            successful_jobs = [j for j in self.completed_jobs if j['success']]
+            if successful_jobs:
+                summary_data = []
+                aaccs = []
+                bwts = []
+                ims = []
+
+                for job in sorted(successful_jobs, key=lambda x: x['seed']):
+                    if 'results' in job and job['results']:
+                        row = {'Seed': job['seed']}
+                        if 'AACC' in job['results']:
+                            row['AACC'] = job['results']['AACC']
+                            aaccs.append(job['results']['AACC'])
+                        if 'BWT' in job['results']:
+                            row['BWT'] = job['results']['BWT']
+                            bwts.append(job['results']['BWT'])
+                        if 'IM' in job['results']:
+                            row['IM'] = job['results']['IM']
+                            ims.append(job['results']['IM'])
+
+                        if 'AACC' in row or 'BWT' in row or 'IM' in row:
+                            summary_data.append(row)
+
+                if summary_data:
+                    summary_file = os.path.join(log_dir, "seed_metrics_summary.txt")
+                    with open(summary_file, 'w') as f:
+                        f.write("=" * 70 + "\n")
+                        f.write("多 Seed 持续学习指标汇总\n")
+                        f.write("=" * 70 + "\n\n")
+
+                        # 表头
+                        f.write(f"{'Seed':<10} {'AACC':<12} {'BWT':<12} {'IM':<12}\n")
+                        f.write("-" * 46 + "\n")
+
+                        # 数据行
+                        for item in summary_data:
+                            seed_str = f"{item['Seed']:<10}"
+                            aacc_str = f"{item.get('AACC', 0):.4f}" if 'AACC' in item else "N/A"
+                            bwt_str = f"{item.get('BWT', 0):.4f}" if 'BWT' in item else "N/A"
+                            im_str = f"{item.get('IM', 0):.4f}" if 'IM' in item else "N/A"
+                            f.write(f"{seed_str} {aacc_str:<12} {bwt_str:<12} {im_str:<12}\n")
+
+                        f.write("\n" + "=" * 70 + "\n")
+                        f.write("统计信息（均值 ± 标准差）\n")
+                        f.write("=" * 70 + "\n")
+
+                        # AACC 统计
+                        if aaccs:
+                            mean_aacc = sum(aaccs) / len(aaccs)
+                            std_aacc = pd.Series(aaccs).std()
+                            f.write(f"AACC: {mean_aacc:.4f} ± {std_aacc:.4f}  (Max: {max(aaccs):.4f}, Min: {min(aaccs):.4f})\n")
+
+                        # BWT 统计
+                        if bwts:
+                            mean_bwt = sum(bwts) / len(bwts)
+                            std_bwt = pd.Series(bwts).std()
+                            f.write(f"BWT:  {mean_bwt:.4f} ± {std_bwt:.4f}  (Max: {max(bwts):.4f}, Min: {min(bwts):.4f})\n")
+
+                        # IM 统计
+                        if ims:
+                            mean_im = sum(ims) / len(ims)
+                            std_im = pd.Series(ims).std()
+                            f.write(f"IM:   {mean_im:.4f} ± {std_im:.4f}  (Max: {max(ims):.4f}, Min: {min(ims):.4f})\n")
+
+                        f.write("=" * 70 + "\n")
+
+                    print(f"指标汇总已保存到: {summary_file}")
+
             print("=" * 100 + "\n")
 
 
@@ -364,15 +502,15 @@ def main():
                         help='每个GPU上最多并行运行的任务数')
 
     # 实验配置
-    parser.add_argument('--preset', type=str, default='configs/csc_clam_cl.yaml',
+    parser.add_argument('--preset', type=str, default='configs/csc_clam_cl_debug.yaml',
                         help='配置文件路径')
     parser.add_argument('--cl-method', type=str, default='prev',
                         help='持续学习方法')
     parser.add_argument('--buffer-size', type=int, default=42,
                         help='Buffer大小')
-    parser.add_argument('--exp-name-prefix', type=str, default='csc_clam_cl_buf42_attn_logit',
+    parser.add_argument('--exp-name-prefix', type=str, default='csc_clam_cl_debug',
                         help='实验名称前缀，会自动添加 _seedX')
-    parser.add_argument('--log-dir', type=str, default='logs',
+    parser.add_argument('--log-dir', type=str, default='debug_seed_logs',
                         help='日志根目录')
 
     # Seed搜索配置
