@@ -38,8 +38,8 @@ opt: adam
 lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4] # float or list
 weight_decay: 0.
 seed: 1
-#epochs: [40, 50, 50] # int or list
-epochs: [1, 1, 1] # int or list
+epochs: [40, 50, 50] # int or list
+# epochs: [1, 1, 1] # int or list
 testing: False
 load: null
 debug: 'False' # False, lite/True (quick check), full (run a few steps)
@@ -48,22 +48,22 @@ folds_end: -1
 
 # cl setting
 cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
-buffer_size: 84 # 84
-buffer_balance: False
+buffer_size: 42  # 42
+buffer_balance: True
 buffer_slide_size: 200 # n_patches in a pseudo slide
-#distill_method: 'maxmin' # 'max', 'random', 'maxmin'
-distill_method: 'random'
+#distill_method: 'maxmin' # 'max', 'random', 'maxmin', mix
+distill_method: 'mix'
+mix_coarse_ratio: 2.0  # for mix method: coarse selection size = mix_coarse_ratio * final_size
 wn: False
 cl_on_current: False
 
 # BCSR Coreset hyperparameters
-bcsr_lr_proxy_model: 10  # learning rate for proxy model
+bcsr_lr_proxy_model: 5  # learning rate for proxy model
 bcsr_beta: 0.1  # beta parameter
-bcsr_out_dim: 100  # output dimension
-bcsr_max_outer_it: 5  # maximum outer iterations
+
+bcsr_max_outer_it: 3  # maximum outer iterations
 bcsr_max_inner_it: 1  # maximum inner iterations
 bcsr_weight_lr: 10  # weight learning rate
-bcsr_candidate_batch_size: 600  # candidate batch size
-bcsr_logging_period: 1000  # logging period
+
 distall_lamda : 0.1
 draw_curve : False

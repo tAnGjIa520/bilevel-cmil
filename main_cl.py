@@ -405,8 +405,6 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         top_p_ids = torch.topk(attn, size)[1][-1]
         rand_ids = torch.randperm(slide.size(0))[:size].to(top_p_ids.device)
         idx = torch.cat((top_p_ids, rand_ids))
-    elif method=="adaptive":
-        pass
     elif method=="kibo":
         # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
         # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
@@ -428,14 +426,49 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
                             logging_period=args.bcsr_logging_period,
                             distall_lamda=args.distall_lamda,
                             draw_curve=args.draw_curve)
-        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide.cpu().numpy(), label.cpu().numpy(), task_id=task_id,
-                                                 topk=args.buffer_size, out_loss=None,seen_classes=seen_classes)
+        # 优化：直接传递 GPU tensor，避免 CPU-GPU 来回传输
+        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
+                                                 topk=size, out_loss=None,seen_classes=seen_classes)
 
-        idx=idx.cpu()
-        # top_p_ids = torch.topk(attn, size)[1][-1]
-        # top_n_ids = torch.topk(-attn, size, dim=1)[1][-1]
-        # idx = torch.cat((top_p_ids, top_n_ids))
+        # idx 已经在正确的设备上，确保与 slide 设备一致
+        idx = idx.to(slide.device)
+    elif method=="mix":
+        # 混合策略：先用 maxrand 粗略筛选，再用 kibo 精细筛选
+        # 第一阶段：使用 maxrand 粗略筛选出较多的候选样本（例如 mix_coarse_ratio*size）
+        mix_coarse_ratio = getattr(args, 'mix_coarse_ratio', 2)  # 默认粗选是精选的2倍
+        coarse_size = int(min(size * mix_coarse_ratio, slide.size(0)))  # 粗选样本数量
+        coarse_size = coarse_size // 2  # maxrand 内部会除以2
+        top_p_ids = torch.topk(attn, coarse_size)[1][-1]
+        rand_ids = torch.randperm(slide.size(0))[:coarse_size].to(top_p_ids.device)
+        coarse_idx = torch.cat((top_p_ids, rand_ids))
 
+        # 获取粗选后的候选样本
+        candidate_slide = slide[coarse_idx]
+
+        # 第二阶段：使用 kibo 在候选样本中精细筛选
+        proxy_model = copy.deepcopy(model)
+        for param in proxy_model.parameters():
+            param.requires_grad = True
+
+        BCSR_Coreset_selector = BCSR_Coreset(
+            proxy_model,
+            lr_proxy_model=args.bcsr_lr_proxy_model,
+            beta=args.bcsr_beta,
+            max_outer_it=args.bcsr_max_outer_it,
+            max_inner_it=args.bcsr_max_inner_it,
+            weight_lr=args.bcsr_weight_lr,
+            distall_lamda=args.distall_lamda,
+            draw_curve=args.draw_curve)
+
+        # 在候选样本中进行精细筛选
+        fine_idx, outer_loss = BCSR_Coreset_selector.coreset_select(
+            proxy_model, candidate_slide, label, task_id=task_id,
+            topk=size, out_loss=None, seen_classes=seen_classes)
+
+        # 将精细筛选的索引映射回原始样本索引
+        # 确保 fine_idx 和 coarse_idx 在同一设备上
+        fine_idx = fine_idx.to(coarse_idx.device)
+        idx = coarse_idx[fine_idx].to(slide.device)
 
 
     else:

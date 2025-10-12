@@ -1,0 +1,18 @@
+{
+  "best_by_mismatch": {
+    "max_outer_it": 30,
+    "max_inner_it": 3,
+    "lr_weight": 0.08,
+    "top_k": 5,
+    "train_mismatch_rate": 32.65,
+    "stage2_test_auc": 0.9996
+  },
+  "best_by_auc": {
+    "max_outer_it": 30,
+    "max_inner_it": 3,
+    "lr_weight": 0.1,
+    "top_k": 3,
+    "stage2_test_auc": 0.9996,
+    "train_mismatch_rate": 47.35
+  }
+}

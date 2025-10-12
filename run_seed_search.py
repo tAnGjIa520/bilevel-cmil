@@ -14,18 +14,23 @@ from datetime import datetime
 import re
 import pandas as pd
 import os
+import wandb
 
 
 class GPUScheduler:
     """GPU任务调度器"""
 
-    def __init__(self, gpu_ids: List[int], max_jobs_per_gpu: int = 1):
+    def __init__(self, gpu_ids: List[int], max_jobs_per_gpu: int = 1, wandb_project: str = "CMIL", wandb_config: Dict = None, exp_name_prefix: str = "seed_search", notes: str = None):
         """
         初始化GPU调度器
 
         Args:
             gpu_ids: 可用的GPU ID列表，例如 [0, 1, 2, 3]
             max_jobs_per_gpu: 每个GPU上最多并行运行的任务数
+            wandb_project: wandb 项目名称
+            wandb_config: wandb 配置字典
+            exp_name_prefix: 实验名称前缀
+            notes: wandb 实验备注
         """
         self.gpu_ids = gpu_ids
         self.max_jobs_per_gpu = max_jobs_per_gpu
@@ -35,6 +40,17 @@ class GPUScheduler:
         self.running_processes: List[Dict] = []
         # 记录所有完成的任务结果
         self.completed_jobs: List[Dict] = []
+
+        # 登录 wandb（只在当前进程生效）
+        wandb.login(key="bd9541d4de0608784f26f2a79c055900f364d762", relogin=True)
+
+        # 初始化 wandb
+        self.wandb_run = wandb.init(
+            project=wandb_project,
+            name=f"seed_search_{exp_name_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            config=wandb_config or {},
+            notes=notes
+        )
 
     def get_available_gpu(self) -> int:
         """获取一个可用的GPU ID"""
@@ -447,6 +463,48 @@ class GPUScheduler:
 
                     print(f"指标汇总已保存到: {summary_file}")
 
+                    # 将结果写入 wandb 表格
+                    wandb_table = wandb.Table(columns=["Seed", "AACC", "BWT", "IM"])
+                    for item in summary_data:
+                        wandb_table.add_data(
+                            item['Seed'],
+                            item.get('AACC', None),
+                            item.get('BWT', None),
+                            item.get('IM', None)
+                        )
+                    wandb.log({"seed_results": wandb_table})
+
+                    # 发送完成告警
+                    alert_text = f"Seed搜索实验完成！\n"
+                    alert_text += f"成功任务数: {len(successful_jobs)}/{len(self.completed_jobs)}\n\n"
+
+                    # 列出所有任务的详细结果
+                    alert_text += "=" * 50 + "\n"
+                    for item in summary_data:
+                        alert_text += f"Seed {item['Seed']}: "
+                        if 'AACC' in item:
+                            alert_text += f"AACC={item['AACC']:.4f} "
+                        if 'BWT' in item:
+                            alert_text += f"BWT={item['BWT']:.4f} "
+                        if 'IM' in item:
+                            alert_text += f"IM={item['IM']:.4f}"
+                        alert_text += "\n"
+
+                    # 添加统计信息
+                    alert_text += "=" * 50 + "\n"
+                    if aaccs:
+                        alert_text += f"AACC: {sum(aaccs)/len(aaccs):.4f} ± {pd.Series(aaccs).std():.4f}\n"
+                    if bwts:
+                        alert_text += f"BWT: {sum(bwts)/len(bwts):.4f} ± {pd.Series(bwts).std():.4f}\n"
+                    if ims:
+                        alert_text += f"IM: {sum(ims)/len(ims):.4f} ± {pd.Series(ims).std():.4f}"
+
+                    wandb.alert(
+                        title="Seed搜索实验完成",
+                        text=alert_text
+                    )
+                    print("\n已发送 wandb 告警通知")
+
             print("=" * 100 + "\n")
 
 
@@ -502,15 +560,15 @@ def main():
                         help='每个GPU上最多并行运行的任务数')
 
     # 实验配置
-    parser.add_argument('--preset', type=str, default='configs/csc_clam_cl_debug.yaml',
+    parser.add_argument('--preset', type=str, default='configs/csc_clam_cl.yaml',
                         help='配置文件路径')
     parser.add_argument('--cl-method', type=str, default='prev',
                         help='持续学习方法')
     parser.add_argument('--buffer-size', type=int, default=42,
                         help='Buffer大小')
-    parser.add_argument('--exp-name-prefix', type=str, default='csc_clam_cl_debug',
+    parser.add_argument('--exp-name-prefix', type=str, default='origin_logs',
                         help='实验名称前缀，会自动添加 _seedX')
-    parser.add_argument('--log-dir', type=str, default='debug_seed_logs',
+    parser.add_argument('--log-dir', type=str, default='origin_logs',
                         help='日志根目录')
 
     # Seed搜索配置
@@ -522,6 +580,8 @@ def main():
                         help='只打印命令，不实际运行')
     parser.add_argument('--check-interval', type=float, default=10.0,
                         help='检查任务完成的时间间隔（秒）')
+    parser.add_argument('--notes', type=str, default=None,
+                        help='wandb 实验备注')
 
     args = parser.parse_args()
 
@@ -575,8 +635,16 @@ def main():
             print(f"命令: {' '.join(cmd_info['cmd'])}")
         return
 
-    # 创建GPU调度器
-    scheduler = GPUScheduler(gpu_ids, args.max_jobs_per_gpu)
+    # 创建GPU调度器，传入 wandb 配置
+    wandb_config = {
+        'gpus': gpu_ids,
+        'max_jobs_per_gpu': args.max_jobs_per_gpu,
+        'seeds': seeds,
+        'cl_method': args.cl_method,
+        'buffer_size': args.buffer_size,
+        'base_config': args.preset
+    }
+    scheduler = GPUScheduler(gpu_ids, args.max_jobs_per_gpu, wandb_project="CMIL", wandb_config=wandb_config, exp_name_prefix=args.exp_name_prefix, notes=args.notes)
 
     print("=" * 80)
     print("开始执行任务")
@@ -604,6 +672,10 @@ def main():
     # 打印汇总表格并保存结果
     scheduler.print_summary_table(log_dir=args.log_dir)
     scheduler.save_results(log_dir=args.log_dir)
+
+    # 关闭 wandb
+    wandb.finish()
+    print("wandb run 已完成")
 
 
 if __name__ == "__main__":

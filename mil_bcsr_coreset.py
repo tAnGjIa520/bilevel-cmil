@@ -11,20 +11,19 @@ class BCSR_Coreset:
         proxy_model: model for coreset selection
         lr_proxy_model: learning rare for proxy_model
         beta: balance the loss and regularizer
-        out_dim: input dimension
+
         max_outer_it: outer loops for bilevel optimizaiton
         max_inner_it: inner loops for bilevel optimizaiton
         weight_lr: step size for updating samlple weights
-        candidate_batch_size: number of coreset candidates
+       
     """
-    def __init__(self, proxy_model, lr_proxy_model,  beta, out_dim=10, max_outer_it=50, max_inner_it=1, weight_lr=1e-1,
-                candidate_batch_size=600, logging_period=1000, device='cuda',distall_lamda=0.1,draw_curve=False):
-        self.out_dim = out_dim
+    def __init__(self, proxy_model, lr_proxy_model,  beta, max_outer_it=50, max_inner_it=1, weight_lr=1e-1, device='cuda',distall_lamda=0.1,draw_curve=False):
+
         self.max_outer_it = max_outer_it
         self.max_inner_it = max_inner_it
         self.weight_lr = weight_lr
-        self.candidate_batch_size = candidate_batch_size
-        self.logging_period = logging_period
+
+
         self.nystrom_batch = None
         self.nystrom_normalization = None
         self.param_size=  []
@@ -51,6 +50,7 @@ class BCSR_Coreset:
 
     def projection_onto_simplex(self, v, b=1):
         # v 权重
+        device = v.device  # 优化：记住原始设备
         v = v.cpu().detach().numpy()
         n_features = v.shape[0]
         u = np.sort(v)[::-1]
@@ -60,23 +60,38 @@ class BCSR_Coreset:
         rho = ind[cond][-1]
         theta = cssv[cond][-1] / float(rho)
         w = np.maximum(v - theta, 0)
-        w = torch.from_numpy(w).cuda()
+        w = torch.from_numpy(w).to(device)  # 优化：恢复到原始设备而非硬编码 cuda
         w.requires_grad = True
         return w
 
     def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None,seen_classes=None):
         np.random.seed(self.seed)
-        if isinstance(y, np.ndarray):
-            y = torch.from_numpy(y).float()
+
+        # 优化：统一处理输入数据，确保是 tensor 并在正确的设备上
+        device = next(model.parameters()).device  # 获取模型所在设备
+
         if isinstance(X, np.ndarray):
-            X = torch.from_numpy(X).float()
+            X = torch.from_numpy(X).float().to(device)
+        elif isinstance(X, torch.Tensor):
+            X = X.to(device)  # 确保在正确设备上
+        else:
+            raise TypeError(f"X must be numpy array or torch tensor, got {type(X)}")
+
+        if isinstance(y, np.ndarray):
+            y = torch.from_numpy(y).float().to(device)
+        elif isinstance(y, torch.Tensor):
+            y = y.to(device)  # 确保在正确设备上
+        else:
+            raise TypeError(f"y must be numpy array or torch tensor, got {type(y)}")
+
         n = X.shape[0]
         topk=min(topk, n)
         self.training_model_op.proxy_model.load_state_dict(model.state_dict())
         self.training_model_op.origin_model.load_state_dict(model.state_dict())
         
         # initialize sample weights from uniform distribution
-        coreset_weights = torch.rand([n], dtype=torch.float, requires_grad=True)
+        # 优化：直接在目标设备上创建，避免后续传输
+        coreset_weights = torch.rand([n], dtype=torch.float, requires_grad=True, device=device)
         # project sample weights onto simplex
         # coreset_weights = self.projection_onto_simplex(coreset_weights) # origin
 

@@ -5,6 +5,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+*log/
+*_log/
+
+test*
 *logs/
 *_logs/
 # C extensions

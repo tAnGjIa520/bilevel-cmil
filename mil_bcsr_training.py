@@ -42,9 +42,21 @@ class Training():
         # 加权 w 是一个常数
 
         # 数据准备 - 移到循环外，避免重复的 CPU-GPU 数据传输
-        data = data_S.to(self.device).type(torch.float)
-        target = target_S.to(self.device).type(torch.long)
-        sample_weights = sample_weights.to(self.device).type(torch.float).detach()
+        # 优化：检查是否已在目标设备上，避免不必要的传输
+        if data_S.device != self.device:
+            data = data_S.to(self.device).type(torch.float)
+        else:
+            data = data_S.type(torch.float)
+
+        if target_S.device != self.device:
+            target = target_S.to(self.device).type(torch.long)
+        else:
+            target = target_S.type(torch.long)
+
+        if sample_weights.device != self.device:
+            sample_weights = sample_weights.to(self.device).type(torch.float).detach()
+        else:
+            sample_weights = sample_weights.type(torch.float).detach()
 
         # 创建优化器 - 只创建一次，避免重置优化器状态
         optimizer = torch.optim.SGD(self.proxy_model.parameters(), lr=self.lr_p)
@@ -87,11 +99,24 @@ class Training():
 
     # train_outer， 更新w，refx这里永远是None
     def train_outer(self, data, target, task_id, data_weights, topk, ref_x=None, ref_y=None,seen_classes=None):
-        data = data.to(self.device)
-        target = target.to(self.device).type(torch.long)
-        sample_weights = data_weights.to(self.device)
-        X_S = data[:].to(self.device)
-        y_S = target[:].to(self.device).type(torch.long)
+        # 优化：检查设备并避免重复传输
+        if data.device != self.device:
+            data = data.to(self.device)
+
+        if target.device != self.device:
+            target = target.to(self.device).type(torch.long)
+        else:
+            target = target.type(torch.long)
+
+        if data_weights.device != self.device:
+            sample_weights = data_weights.to(self.device)
+        else:
+            sample_weights = data_weights
+
+        # 优化：直接使用，无需再次 .to(device)
+        X_S = data[:]
+        y_S = target[:]
+
         return self.update_sample_weights(data, target, task_id, X_S, y_S, sample_weights, topk, beta=self.beta, ref_x=ref_x, ref_y=ref_y,seen_classes=seen_classes)
 
 
@@ -101,22 +126,23 @@ class Training():
 
         proxy_output = self.proxy_model(input_train, target_train, instance_eval=True, return_features=True, seen_classes=seen_classes)
 
-        
-        
         loss_outer = F.cross_entropy(proxy_output["logits"],target_train, reduction='none')
         
         topk_weights, ind = sample_weights.topk(topk)
         
         if self.origin_model is not None:
-            
+
             with torch.no_grad():
                 origin_output=self.origin_model(input_train, target_train, instance_eval=True, return_features=True, seen_classes=seen_classes)
-            
-            distall_loss = F.mse_loss(
+
+            # 使用余弦相似度损失：1 - cosine_similarity
+            # cosine_similarity 返回 [-1, 1]，我们用 1 - sim 得到 [0, 2] 的损失
+            cosine_sim = F.cosine_similarity(
                 origin_output["features"].detach(),
                 proxy_output["features"],
-                reduction='none'
-            ).mean()
+                dim=-1
+            )
+            distall_loss = (1 - cosine_sim).mean()
             
 
         
@@ -136,43 +162,8 @@ class Training():
         normalized_weights = F.normalize(sample_weights.unsqueeze(0), p=2, dim=1).squeeze(0)
         topk_weights = self.topk_selectors[topk](normalized_weights)
 
-        # 可视化权重分布
-        # if self.draw_curve:
-        #     # 转换为numpy并从大到小排序
-        #     sample_weights_np = sample_weights.detach().cpu().numpy()
-        #     normalized_weights_np = normalized_weights.detach().cpu().numpy()
-        #     topk_weights_np = topk_weights.detach().cpu().numpy()
-
-        #     # 按sample_weights从大到小排序
-        #     sorted_indices = np.argsort(sample_weights_np)[::-1]
-
-        #     sample_weights_sorted = sample_weights_np[sorted_indices]
-        #     normalized_weights_sorted = normalized_weights_np[sorted_indices]
-        #     topk_weights_sorted = topk_weights_np[sorted_indices]
-
-        #     # 创建图表
-        #     plt.figure(figsize=(12, 6))
-        #     x_axis = np.arange(len(sample_weights_sorted))
-
-        #     plt.plot(x_axis, sample_weights_sorted, 'b-', label='Sample Weights', linewidth=2, alpha=0.7)
-        #     plt.plot(x_axis, normalized_weights_sorted, 'g--', label='Normalized Weights', linewidth=2, alpha=0.7)
-        #     plt.plot(x_axis, topk_weights_sorted, 'r:', label='TopK Weights', linewidth=2, alpha=0.7)
-
-        #     plt.xlabel('Sample Index (sorted by Sample Weights)', fontsize=12)
-        #     plt.ylabel('Weight Value', fontsize=12)
-        #     plt.title('Weight Distribution Comparison (Sorted in Descending Order)', fontsize=14, fontweight='bold')
-        #     plt.legend(fontsize=11, loc='upper right')
-        #     plt.grid(True, alpha=0.3, linestyle='--')
-        #     plt.tight_layout()
-
-        #     # 保存图表
-        #     plt.savefig(f'weights_visualization_task{task_id}.png', dpi=150, bbox_inches='tight')
-        #     plt.close()
-        #     print(f"  💾 Weights visualization saved to: weights_visualization_task{task_id}.png")
-            # self.draw_curve=False  # 只绘制一次
         # 使用 unsqueeze 替代转置操作，更高效
         weighted_input = input_selected * topk_weights.unsqueeze(1)
-        
         
         loss_inner = torch.mean( F.cross_entropy(
             self.proxy_model(weighted_input, target_selected, instance_eval=True, return_features=True, seen_classes=seen_classes)["logits"], target_selected, reduction='none'))
@@ -186,7 +177,6 @@ class Training():
                 G_theta.append(p-self.lr_p*g)
         v_Q = v_0
 
-
         for _ in range(3):
 
             para_list=self.proxy_model.parameters()
@@ -196,6 +186,9 @@ class Training():
                 v_Q[i].add_(v_0[i].detach())
         grads_theta=[i for i in grads_theta if i is not None]
         jacobian = -torch.autograd.grad(grads_theta, sample_weights, grad_outputs=v_Q,allow_unused=True)[0]
+        
+        
+        
         with torch.no_grad():
             sample_weights -= self.lr_w * jacobian
 

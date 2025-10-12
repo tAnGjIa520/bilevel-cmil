@@ -48,20 +48,18 @@ folds_end: -1
 # cl setting
 cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
 buffer_size: 3 # 减小buffer大小用于调试
-buffer_balance: False
+buffer_balance: True
 buffer_slide_size: 50 # 减小slide大小用于调试
-distill_method: 'maxmin'
+distill_method: 'mix'
+mix_coarse_ratio: 2  # for mix method: coarse selection size = mix_coarse_ratio * final_size
 wn: False
 cl_on_current: False
 
 # BCSR Coreset hyperparameters
 bcsr_lr_proxy_model: 10  # learning rate for proxy model
 bcsr_beta: 0.1  # beta parameter
-bcsr_out_dim: 100  # output dimension
-bcsr_max_outer_it: 10  # maximum outer iterations
-bcsr_max_inner_it: 3  # maximum inner iterations
+bcsr_max_outer_it: 3  # maximum outer iterations
+bcsr_max_inner_it: 1  # maximum inner iterations
 bcsr_weight_lr: 10  # weight learning rate
-bcsr_candidate_batch_size: 600  # candidate batch size
-bcsr_logging_period: 1000  # logging period
 distall_lamda : 0.1
 draw_curve : True
