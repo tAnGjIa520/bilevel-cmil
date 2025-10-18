@@ -1,15 +1,17 @@
 """
-Attention-based Multiple Instance Learning - Harder Tasks Collection
-更难的多实例学习任务集合
+Multiple Instance Learning - Harder Tasks Collection
+支持多种实例选择方法：Attention, KIBO双层优化, Random
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_recall_fscore_support
 import argparse
+import copy
 
 
 class AttentionMIL(nn.Module):
@@ -150,6 +152,289 @@ def evaluate(model, dataloader, criterion, device):
     )
 
     return avg_loss, acc, auc, precision, recall, f1
+
+
+# ============================================================
+# KIBO双层优化实例选择
+# ============================================================
+
+class BilevelInstanceSelection:
+    """
+    基于双层优化的实例选择（KIBO方法）
+
+    内层：在加权实例上训练代理模型
+    外层：优化实例权重使验证损失最小
+    """
+
+    def __init__(self, model, lr_model=0.01, lr_weight=0.1,
+                 max_outer_it=20, max_inner_it=3, device='cuda'):
+        self.proxy_model = copy.deepcopy(model)
+        self.origin_model = copy.deepcopy(model)
+        self.lr_model = lr_model
+        self.lr_weight = lr_weight
+        self.max_outer_it = max_outer_it
+        self.max_inner_it = max_inner_it
+        self.device = device
+
+    def train_inner(self, data, labels, weights):
+        """内层训练：在加权数据上训练代理模型"""
+        self.proxy_model.train()
+        optimizer = torch.optim.SGD(self.proxy_model.parameters(), lr=self.lr_model)
+
+        total_loss = 0
+        for _ in range(self.max_inner_it):
+            optimizer.zero_grad()
+
+            # 加权数据
+            weighted_data = data * weights.unsqueeze(1)
+            y_prob, _ = self.proxy_model(weighted_data.unsqueeze(0))
+
+            # 二分类损失
+            # 确保labels是tensor且形状正确
+            if not isinstance(labels, torch.Tensor):
+                labels = torch.tensor(labels, device=self.device)
+            labels = labels.view(-1).float()
+            loss = F.binary_cross_entropy(y_prob.view(-1), labels)
+            loss.backward()
+            optimizer.step()
+            total_loss = loss.item()
+
+        return total_loss
+
+    def train_outer(self, data, labels, weights, topk):
+        """外层训练：优化实例权重"""
+        # self.proxy_model.eval()
+
+        # 前向传播计算验证损失
+        y_prob, _ = self.proxy_model(data.unsqueeze(0))
+        
+        y_prob = y_prob.view(-1)
+        labels = labels.view(-1)
+        
+        outer_loss = F.binary_cross_entropy(y_prob, labels.float())
+
+        # 选择top-k权重的正则化
+        topk_weights, _ = weights.topk(topk)
+        reg_term = -topk_weights.sum()  # 鼓励选择高权重
+
+        total_loss = outer_loss + 1 * reg_term
+
+        # 计算权重梯度（简化版，不使用完整隐式梯度）
+        if weights.requires_grad:
+            grad = torch.autograd.grad(total_loss, weights, retain_graph=True)[0]
+        else:
+            grad = torch.zeros_like(weights)
+
+        # 更新权重
+        with torch.no_grad():
+            weights -= self.lr_weight * grad
+            weights = torch.clamp(weights, min=0, max=1)
+
+        return weights, total_loss.item()
+
+    def select_instances(self, data, label, topk):
+        """
+        对单个包进行实例选择
+
+        Args:
+            data: [num_instances, input_dim] 包中的实例
+            label: 包标签
+            topk: 选择的实例数量
+
+        Returns:
+            selected_indices: 选中的实例索引
+        """
+        data = data.to(self.device)
+        label = torch.tensor([label], dtype=torch.float32).to(self.device)
+
+        n = data.shape[0]
+        topk = min(topk, n)
+
+        # 初始化实例权重
+        weights = torch.rand(n, requires_grad=True, device=self.device)
+
+        # 加载初始模型状态
+        self.proxy_model.load_state_dict(self.origin_model.state_dict())
+
+        # 双层优化
+        for outer_it in range(self.max_outer_it):
+            # 内层：训练代理模型
+            inner_loss = self.train_inner(data, label, weights.detach())
+
+            # 外层：优化权重
+            weights, outer_loss = self.train_outer(data, label, weights, topk)
+
+        # 选择top-k实例
+        _, selected_indices = weights.topk(topk)
+
+        return selected_indices.cpu().numpy()
+
+
+def extract_instances(model, dataset, device, check_label_fn, selection_method='random',
+                      top_k=3, bottom_k=2, bilevel_params=None):
+    """
+    统一的实例选择接口，支持多种选择方法
+
+    Args:
+        model: 训练好的模型
+        dataset: 原始数据集
+        device: 设备
+        check_label_fn: 检查标签的函数
+        selection_method: 选择方法 ('attention', 'kibo', 'random')
+        top_k: 选择的实例数量（或attention方法的top-k）
+        bottom_k: attention方法的bottom-k
+        bilevel_params: KIBO方法的参数字典
+
+    Returns:
+        new_bags, new_labels, mismatch_stats
+    """
+    if selection_method == 'attention':
+        return extract_attention_based_instances(model, dataset, device, check_label_fn, top_k, bottom_k)
+    elif selection_method == 'kibo':
+        return extract_kibo_based_instances(model, dataset, device, check_label_fn, top_k, bilevel_params)
+    elif selection_method == 'random':
+        return extract_random_instances(model, dataset, device, check_label_fn, top_k)
+    
+    else:
+        raise ValueError(f"Unknown selection method: {selection_method}")
+    
+
+def extract_random_instances(model, dataset, device, check_label_fn, num_select=5):
+    """随机选择实例（baseline方法）"""
+    new_bags = []
+    new_labels = []
+
+    total_bags = 0
+    mismatch_count = 0
+    pos_to_neg = 0
+    neg_to_pos = 0
+
+    print(f"\n从{len(dataset)}个包中随机选择实例...")
+    print(f"策略: 每个包随机选择{num_select}个实例")
+
+    np.random.seed(42)
+
+    for i in range(len(dataset)):
+        bag, label = dataset[i]
+        items = dataset.bags[i]
+
+        num_instances = len(items)
+        num_select_actual = min(num_select, num_instances)
+
+        # 随机选择
+        selected_indices = np.random.choice(num_instances, num_select_actual, replace=False)
+        new_bag = [items[idx] for idx in selected_indices]
+
+        new_bags.append(new_bag)
+        new_labels.append(label)
+
+        # 检查标签一致性
+        original_label = int(label)
+        true_label_for_new_bag = 1 if check_label_fn(new_bag) else 0
+
+        total_bags += 1
+        if original_label != true_label_for_new_bag:
+            mismatch_count += 1
+            if original_label == 1 and true_label_for_new_bag == 0:
+                pos_to_neg += 1
+            elif original_label == 0 and true_label_for_new_bag == 1:
+                neg_to_pos += 1
+
+    avg_size = np.mean([len(bag) for bag in new_bags])
+
+    print(f"完成! 创建了{len(new_bags)}个新包")
+    print(f"平均包大小: {avg_size:.2f} (原始: {np.mean([len(dataset.bags[i]) for i in range(len(dataset))]):.2f})")
+    print(f"\n标签一致性检查:")
+    print(f"  总包数: {total_bags}")
+    print(f"  标签不一致: {mismatch_count} ({mismatch_count/total_bags*100:.2f}%)")
+    print(f"    - 正包→负包: {pos_to_neg} ({pos_to_neg/total_bags*100:.2f}%)")
+    print(f"    - 负包→正包: {neg_to_pos} ({neg_to_pos/total_bags*100:.2f}%)")
+    print(f"  标签一致: {total_bags - mismatch_count} ({(total_bags-mismatch_count)/total_bags*100:.2f}%)")
+
+    mismatch_stats = {
+        'total': total_bags,
+        'mismatch': mismatch_count,
+        'pos_to_neg': pos_to_neg,
+        'neg_to_pos': neg_to_pos,
+        'mismatch_rate': mismatch_count / total_bags
+    }
+    exit(0)
+    return new_bags, new_labels, mismatch_stats
+
+
+def extract_kibo_based_instances(model, dataset, device, check_label_fn, topk=5, bilevel_params=None):
+    """基于KIBO双层优化的实例选择"""
+    if bilevel_params is None:
+        bilevel_params = {'max_outer_it': 10, 'max_inner_it': 2, 'lr_weight': 0.1}
+
+    new_bags = []
+    new_labels = []
+
+    total_bags = 0
+    mismatch_count = 0
+    pos_to_neg = 0
+    neg_to_pos = 0
+
+    print(f"\n从{len(dataset)}个包中使用KIBO双层优化选择实例...")
+    print(f"策略: 每个包选择top-{topk}个实例")
+    print(f"参数: outer_it={bilevel_params.get('max_outer_it', 10)}, "
+          f"inner_it={bilevel_params.get('max_inner_it', 2)}")
+
+    # 创建双层优化选择器
+    selector = BilevelInstanceSelection(
+        model,
+        max_outer_it=bilevel_params.get('max_outer_it', 10),
+        max_inner_it=bilevel_params.get('max_inner_it', 2),
+        lr_weight=bilevel_params.get('lr_weight', 0.1),
+        device=device
+    )
+
+    for i in range(len(dataset)):
+        bag, label = dataset[i]
+        items = dataset.bags[i]
+
+        # 使用KIBO选择实例
+        selected_indices = selector.select_instances(bag, label, topk)
+        new_bag = [items[idx] for idx in selected_indices]
+
+        new_bags.append(new_bag)
+        new_labels.append(label)
+
+        # 检查标签一致性
+        original_label = int(label)
+        true_label_for_new_bag = 1 if check_label_fn(new_bag) else 0
+
+        total_bags += 1
+        if original_label != true_label_for_new_bag:
+            mismatch_count += 1
+            if original_label == 1 and true_label_for_new_bag == 0:
+                pos_to_neg += 1
+            elif original_label == 0 and true_label_for_new_bag == 1:
+                neg_to_pos += 1
+
+        if (i + 1) % 100 == 0:
+            print(f"  已处理 {i+1}/{len(dataset)} 个包...")
+
+    avg_size = np.mean([len(bag) for bag in new_bags])
+
+    print(f"完成! 创建了{len(new_bags)}个新包")
+    print(f"平均包大小: {avg_size:.2f} (原始: {np.mean([len(dataset.bags[i]) for i in range(len(dataset))]):.2f})")
+    print(f"\n标签一致性检查:")
+    print(f"  总包数: {total_bags}")
+    print(f"  标签不一致: {mismatch_count} ({mismatch_count/total_bags*100:.2f}%)")
+    print(f"    - 正包→负包: {pos_to_neg} ({pos_to_neg/total_bags*100:.2f}%)")
+    print(f"    - 负包→正包: {neg_to_pos} ({neg_to_pos/total_bags*100:.2f}%)")
+    print(f"  标签一致: {total_bags - mismatch_count} ({(total_bags-mismatch_count)/total_bags*100:.2f}%)")
+
+    mismatch_stats = {
+        'total': total_bags,
+        'mismatch': mismatch_count,
+        'pos_to_neg': pos_to_neg,
+        'neg_to_pos': neg_to_pos,
+        'mismatch_rate': mismatch_count / total_bags
+    }
+    
+    return new_bags, new_labels, mismatch_stats
 
 
 def extract_attention_based_instances(model, dataset, device, check_label_fn, top_k=3, bottom_k=2):
@@ -584,7 +869,8 @@ def encode_increasing(bag):
 def run_experiment(task_name, dataset_class, check_fn, encode_fn, input_dim,
                    num_bags_train=2000, num_bags_val=500, num_bags_test=500,
                    num_epochs_stage1=50, num_epochs_stage2=50,
-                   top_k=3, bottom_k=2, **dataset_kwargs):
+                   top_k=3, bottom_k=2, selection_method='attention',
+                   bilevel_params=None, **dataset_kwargs):
     """
     运行两阶段MIL实验
 
@@ -601,6 +887,8 @@ def run_experiment(task_name, dataset_class, check_fn, encode_fn, input_dim,
         num_epochs_stage2: 第二阶段训练轮数
         top_k: 选择top-k个最高attention的实例
         bottom_k: 选择bottom-k个最低attention的实例
+        selection_method: 实例选择方法 ('attention', 'kibo', 'random')
+        bilevel_params: KIBO方法的参数字典
         **dataset_kwargs: 传递给数据集的额外参数
     """
     torch.manual_seed(42)
@@ -612,13 +900,18 @@ def run_experiment(task_name, dataset_class, check_fn, encode_fn, input_dim,
 
     print("="*80)
     print(f"任务: {task_name}")
-    print("两阶段训练: 原始数据 -> Attention过滤 -> 重新训练")
+    print(f"两阶段训练: 原始数据 -> {selection_method.upper()}过滤 -> 重新训练")
     print("="*80)
     print(f"设备: {device}")
     print(f"输入维度: {input_dim}")
+    print(f"包大小范围: {dataset_kwargs.get('bag_size_range', 'N/A')}")
     print(f"第一阶段训练轮数: {num_epochs_stage1}")
     print(f"第二阶段训练轮数: {num_epochs_stage2}")
-    print(f"实例选择策略: top-{top_k} + bottom-{bottom_k}")
+    print(f"实例选择方法: {selection_method}")
+    if selection_method == 'attention':
+        print(f"选择策略: top-{top_k} + bottom-{bottom_k}")
+    else:
+        print(f"选择数量: {top_k}")
 
     # ========== 第一阶段: 在原始数据上训练 ==========
     print("\n" + "="*80)
@@ -682,14 +975,23 @@ def run_experiment(task_name, dataset_class, check_fn, encode_fn, input_dim,
     print("第二阶段: 基于Attention过滤数据并重新训练")
     print("="*80)
 
-    # 提取attention-based实例
-    filtered_train_bags, filtered_train_labels, train_mismatch_stats = extract_attention_based_instances(
-        model_stage1, train_dataset, device, check_fn, top_k=top_k, bottom_k=bottom_k
+    # 提取实例（使用指定的选择方法）
+    filtered_train_bags, filtered_train_labels, train_mismatch_stats = extract_instances(
+        model_stage1, train_dataset, device, check_fn,
+        selection_method=selection_method, top_k=top_k, bottom_k=bottom_k,
+        bilevel_params=bilevel_params
     )
-    filtered_val_bags, filtered_val_labels, val_mismatch_stats = extract_attention_based_instances(
-        model_stage1, val_dataset, device, check_fn, top_k=top_k, bottom_k=bottom_k
-    )
+    
+    exit(0)
 
+    
+    filtered_val_bags, filtered_val_labels, val_mismatch_stats = extract_instances(
+        model_stage1, val_dataset, device, check_fn,
+        selection_method=selection_method, top_k=top_k, bottom_k=bottom_k,
+        bilevel_params=bilevel_params
+    )
+    
+    
     # 创建新数据集
     filtered_train_dataset = FilteredDataset(filtered_train_bags, filtered_train_labels, encode_fn)
     filtered_val_dataset = FilteredDataset(filtered_val_bags, filtered_val_labels, encode_fn)
@@ -766,17 +1068,47 @@ def run_experiment(task_name, dataset_class, check_fn, encode_fn, input_dim,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Attention MIL - Harder Tasks')
-    parser.add_argument('--task', type=str, default='large_range',
+    parser = argparse.ArgumentParser(description='MIL - Harder Tasks with Multiple Selection Methods')
+    parser.add_argument('--task', type=str, default='triplet',
                         choices=['large_range', 'triplet', 'sum', 'increasing', 'all'],
                         help='选择要运行的任务')
-    parser.add_argument('--epochs1', type=int, default=50, help='第一阶段训练轮数')
-    parser.add_argument('--epochs2', type=int, default=50, help='第二阶段训练轮数')
-    parser.add_argument('--top_k', type=int, default=3, help='选择top-k个最高attention的实例')
-    parser.add_argument('--bottom_k', type=int, default=2, help='选择bottom-k个最低attention的实例')
-    parser.add_argument('--num_bags', type=int, default=2000, help='训练集包数量')
+    parser.add_argument('--selection_method', type=str, default='attention',
+                        choices=['attention', 'kibo', 'random', 'compare'],
+                        help='实例选择方法: attention(基于注意力), kibo(双层优化), random(随机), compare(对比所有方法)')
+    parser.add_argument('--epochs1', type=int, default=10, help='第一阶段训练轮数')
+    parser.add_argument('--epochs2', type=int, default=10, help='第二阶段训练轮数')
+    parser.add_argument('--new_size', type=int, default=10, help='新包的大小(选择的实例数量)')
+    parser.add_argument('--num_bags', type=int, default=1000, help='训练集包数量')
+    parser.add_argument('--kibo_outer_it', type=int, default=10, help='KIBO外层迭代次数')
+    parser.add_argument('--kibo_inner_it', type=int, default=2, help='KIBO内层迭代次数')
+    parser.add_argument('--kibo_lr_weight', type=float, default=0.1, help='KIBO权重学习率')
+    parser.add_argument('--bag_size_min', type=int, default=20, help='包大小的最小值')
+    parser.add_argument('--bag_size_max', type=int, default=50, help='包大小的最大值')
 
     args = parser.parse_args()
+
+    # 根据 new_size 自动计算 top_k 和 bottom_k
+    # attention 方法: 对半分，top_k 取一半，bottom_k 取另一半
+    # 其他方法: top_k = new_size, bottom_k = 0
+    top_k = args.new_size // 2
+    bottom_k = args.new_size - top_k  # 确保总数正好是 new_size
+
+    print(f"\n{'='*80}")
+    print(f"实例选择配置:")
+    print(f"  新包大小 (new_size): {args.new_size}")
+    print(f"  Attention方法 -> top_k: {top_k}, bottom_k: {bottom_k}")
+    print(f"  其他方法 (KIBO/Random) -> 选择数量: {args.new_size}")
+    print(f"{'='*80}\n")
+
+    # 构建KIBO参数
+    bilevel_params = {
+        'max_outer_it': args.kibo_outer_it,
+        'max_inner_it': args.kibo_inner_it,
+        'lr_weight': args.kibo_lr_weight
+    }
+
+    # 包大小范围 (统一由命令行参数控制)
+    bag_size_range = (args.bag_size_min, args.bag_size_max)
 
     tasks = {
         'large_range': {
@@ -785,7 +1117,7 @@ def main():
             'check_fn': check_large_range_consecutive,
             'encode_fn': encode_large_range,
             'input_dim': 100,
-            'dataset_kwargs': {}
+            'dataset_kwargs': {'bag_size_range': bag_size_range}
         },
         'triplet': {
             'name': '三元组检测 (连续三数字)',
@@ -793,7 +1125,7 @@ def main():
             'check_fn': check_triplet,
             'encode_fn': encode_triplet,
             'input_dim': 10,
-            'dataset_kwargs': {}
+            'dataset_kwargs': {'bag_size_range': bag_size_range}
         },
         'sum': {
             'name': '和为10检测 (两数字和)',
@@ -801,7 +1133,7 @@ def main():
             'check_fn': lambda bag: check_sum_to_target(bag, 10),
             'encode_fn': encode_sum,
             'input_dim': 10,
-            'dataset_kwargs': {'target_sum': 10}
+            'dataset_kwargs': {'target_sum': 10, 'bag_size_range': bag_size_range}
         },
         'increasing': {
             'name': '递增序列检测 (3+个数字)',
@@ -809,14 +1141,64 @@ def main():
             'check_fn': lambda bag: check_increasing_sequence(bag, 3),
             'encode_fn': encode_increasing,
             'input_dim': 10,
-            'dataset_kwargs': {'min_seq_len': 3}
+            'dataset_kwargs': {'min_seq_len': 3, 'bag_size_range': bag_size_range}
         }
     }
 
-    if args.task == 'all':
+    if args.selection_method == 'compare':
+        # 对比模式：运行三种方法
+        print("\n" + "🔬"*40)
+        print("对比实验模式：将依次运行 Attention, KIBO, Random 三种方法")
+        print("🔬"*40 + "\n")
+
+        methods = ['attention', 'kibo', 'random']
+        results = {}
+
+        for method in methods:
+            print(f"\n{'='*80}")
+            print(f"🚀 运行方法: {method.upper()}")
+            print(f"{'='*80}\n")
+
+            task_config = tasks[args.task] if args.task != 'all' else tasks['triplet']
+            # 根据方法选择合适的 top_k 和 bottom_k
+            if method == 'attention':
+                method_top_k = top_k
+                method_bottom_k = bottom_k
+            else:  # kibo 或 random
+                method_top_k = args.new_size
+                method_bottom_k = 0
+
+            run_experiment(
+                task_name=f"{task_config['name']} [{method.upper()}]",
+                dataset_class=task_config['dataset_class'],
+                check_fn=task_config['check_fn'],
+                encode_fn=task_config['encode_fn'],
+                input_dim=task_config['input_dim'],
+                num_bags_train=args.num_bags,
+                num_bags_val=args.num_bags // 4,
+                num_bags_test=500,
+                num_epochs_stage1=args.epochs1,
+                num_epochs_stage2=args.epochs2,
+                top_k=method_top_k,
+                bottom_k=method_bottom_k,
+                selection_method=method,
+                bilevel_params=bilevel_params if method == 'kibo' else None,
+                **task_config['dataset_kwargs']
+            )
+            print("\n\n")
+
+    elif args.task == 'all':
         # 运行所有任务
         for task_key in ['large_range', 'triplet', 'sum', 'increasing']:
             task_config = tasks[task_key]
+            # 根据方法选择合适的 top_k 和 bottom_k
+            if args.selection_method == 'attention':
+                method_top_k = top_k
+                method_bottom_k = bottom_k
+            else:  # kibo 或 random
+                method_top_k = args.new_size
+                method_bottom_k = 0
+
             run_experiment(
                 task_name=task_config['name'],
                 dataset_class=task_config['dataset_class'],
@@ -828,14 +1210,24 @@ def main():
                 num_bags_test=500,
                 num_epochs_stage1=args.epochs1,
                 num_epochs_stage2=args.epochs2,
-                top_k=args.top_k,
-                bottom_k=args.bottom_k,
+                top_k=method_top_k,
+                bottom_k=method_bottom_k,
+                selection_method=args.selection_method,
+                bilevel_params=bilevel_params if args.selection_method == 'kibo' else None,
                 **task_config['dataset_kwargs']
             )
             print("\n\n")
     else:
         # 运行单个任务
         task_config = tasks[args.task]
+        # 根据方法选择合适的 top_k 和 bottom_k
+        if args.selection_method == 'attention':
+            method_top_k = top_k
+            method_bottom_k = bottom_k
+        else:  # kibo 或 random
+            method_top_k = args.new_size
+            method_bottom_k = 0
+
         run_experiment(
             task_name=task_config['name'],
             dataset_class=task_config['dataset_class'],
@@ -847,8 +1239,10 @@ def main():
             num_bags_test=500,
             num_epochs_stage1=args.epochs1,
             num_epochs_stage2=args.epochs2,
-            top_k=args.top_k,
-            bottom_k=args.bottom_k,
+            top_k=method_top_k,
+            bottom_k=method_bottom_k,
+            selection_method=args.selection_method,
+            bilevel_params=bilevel_params if args.selection_method == 'kibo' else None,
             **task_config['dataset_kwargs']
         )
 

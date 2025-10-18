@@ -447,10 +447,10 @@ def compute_convergence_score(loss_list):
             'oscillation': float(oscillation_score),
             'initial_loss': float(losses[0]),
             'final_loss': float(losses[-1]),
-            'total_decrease': float(total_decrease),
-            'loss_history': losses.tolist()
+            'total_decrease': float(total_decrease)
         }
     }
+
 
 def kd_loss_fn(train_logits, prev_logits, ta = 2, softmax = True):
     """
@@ -471,12 +471,153 @@ def kd_loss_fn(train_logits, prev_logits, ta = 2, softmax = True):
     dist_loss = torch.nn.functional.kl_div(log_p, q, reduction = "batchmean")
     return dist_loss
 
-def adaptive_distill(slide,  size=1e5, method='random',model=None):
-    pass
+
+def compute_loss(args, model, batch, out, task, old_model=None, old_seen_classes=None, seen_classes=None, is_buffer_batch=False):
+    """
+    统一的损失计算函数
+
+    参数:
+        args: 配置参数
+        model: 当前模型
+        batch: 输入batch字典，包含 'features', 'label', 可选 'logits'
+        out: 模型输出
+        task: 当前任务ID
+        old_model: 旧模型（用于知识蒸馏）
+        old_seen_classes: 旧的已见类别
+        seen_classes: 当前已见类别
+        is_buffer_batch: 是否是buffer中的batch
+
+    返回:
+        loss: 总损失
+        loss_dict: 各项损失的字典（用于日志记录）
+    """
+    loss_dict = {}
+
+    # ====== 1. 基础损失计算 ======
+    if args.net == 'transmil':
+        # TransMIL: 分类损失
+        loss = F.cross_entropy(out['logits'], batch['label'])
+        loss_dict['loss'] = loss.item()
+
+    elif args.net in ['clam_sb', 'clam_mb']:
+        # CLAM: 包级损失 + 实例级损失
+        bag_loss = F.cross_entropy(out['logits'], batch['label'])
+        inst_loss = out['instance_loss']
+        loss = 0.7 * bag_loss + 0.3 * inst_loss
+        loss_dict['bag_loss'] = bag_loss.item()
+        loss_dict['inst_loss'] = inst_loss.item()
+        loss_dict['loss'] = loss.item()
+    else:
+        raise NotImplementedError(f"Unsupported model: {args.net}")
+
+    # ====== 2. 持续学习损失计算 ======
+    if hasattr(args, 'cl_method') and task > 0:
+        # 2.1 当前任务数据的持续学习损失
+        if (args.cl_on_current and not is_buffer_batch) or is_buffer_batch:
+
+            # Learning without Forgetting (LwF)
+            if args.cl_method == 'LwF':
+                if old_model is not None:
+                    if args.net == 'transmil':
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'])
+                    elif args.net in ['clam_sb', 'clam_mb']:
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, seen_classes=old_seen_classes)
+
+                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
+
+                    if is_buffer_batch:
+                        loss = loss + 10 * kd_loss if args.net == 'transmil' else loss + kd_loss
+                        loss_dict['logits_loss'] = (10 * kd_loss.item()) if args.net == 'transmil' else kd_loss.item()
+                    else:
+                        loss = loss + kd_loss
+                        loss_dict['kd_loss'] = kd_loss.item()
+
+            # DER++ (Dark Experience Replay++)
+            elif args.cl_method == 'derpp' and is_buffer_batch:
+                if 'logits' in batch:
+                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], batch['logits'][:, old_seen_classes])
+                    loss = loss + kd_loss
+                    loss_dict['logits_loss'] = kd_loss.item()
+
+            # MICIL (Memory-Inspired Curriculum Incremental Learning)
+            elif args.cl_method == 'MICIL':
+                if old_model is not None:
+                    if args.net == 'transmil':
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'])
+                    elif args.net in ['clam_sb', 'clam_mb']:
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
+
+                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
+                    em_loss = F.mse_loss(out['features'], old_out['features'])
+                    loss = loss + 10 * kd_loss + em_loss
+
+                    if is_buffer_batch:
+                        loss_dict['logits_loss'] = (10 * kd_loss).item()
+                        loss_dict['features_loss'] = em_loss.item() if args.net in ['clam_sb', 'clam_mb'] else None
+                        loss_dict['em_loss'] = em_loss.item() if args.net == 'transmil' else None
+                    else:
+                        loss_dict['kd_loss'] = (10 * kd_loss).item()
+                        loss_dict['em_loss'] = em_loss.item()
+
+            # PREV (Attention Preservation)
+            elif args.cl_method == 'prev':
+                if old_model is not None:
+                    if args.net == 'transmil':
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'], return_attn=True)
+
+                        if is_buffer_batch:
+                            # Buffer batch: logits + attention + hidden states
+                            logits_loss = 10 * kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
+                            attn_loss = 10 * (kd_loss_fn(out['attn1'], old_out['attn1'], ta=1) + kd_loss_fn(out['attn2'], old_out['attn2'], ta=1))
+                            h_loss = 10 * (F.mse_loss(out['h1'], old_out['h1']) + F.mse_loss(out['h2'], old_out['h2']))
+                            loss = loss + logits_loss + attn_loss + h_loss
+                            loss_dict['logits_loss'] = logits_loss.item()
+                            loss_dict['attn_loss'] = attn_loss.item()
+                            loss_dict['h_loss'] = h_loss.item()
+                        else:
+                            # Current task batch: only attention + hidden states
+                            attn_loss = kd_loss_fn(out['attn1'], old_out['attn1']) + kd_loss_fn(out['attn2'], old_out['attn2']) + \
+                                       F.mse_loss(out['h1'], old_out['h1']) + F.mse_loss(out['h2'], old_out['h2'])
+                            loss = loss + attn_loss
+                            loss_dict['attn_loss'] = attn_loss.item()
+
+                    elif args.net in ['clam_sb', 'clam_mb']:
+                        with torch.no_grad():
+                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
+
+                        attn_loss = kd_loss_fn(out['A'], old_out['A'])
+
+                        if is_buffer_batch:
+                            logits_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
+                            loss = loss + attn_loss + 10 * logits_loss
+                            loss_dict['attn_loss'] = attn_loss.item()
+                            loss_dict['logits_loss'] = (10 * logits_loss).item()
+                        else:
+                            loss = loss + attn_loss
+                            loss_dict['attn_loss'] = attn_loss.item()
+
+            # Experience Replay (ER) - no additional loss
+            elif args.cl_method == 'ER':
+                pass
+
+    # 更新最终损失
+    loss_dict['loss'] = loss.item()
+
+    return loss, loss_dict
+
 import copy
 # todo:关键，从一个大的patch 里面挑选出子集
 def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=None,task_id=None,seen_classes=None,tb_writer=None):
     assert len(slide.shape) == 2, f"slide shape: {slide.shape}"
+    
+    
+    print(f"Distilling slide from {slide.size(0)} to {size} patches using method '{method}'")
+    
     size = int(min(size, slide.size(0)))
     if method == 'random':
         idx = torch.randperm(slide.size(0))[:size]
@@ -527,42 +668,43 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         idx = idx.to(slide.device)
 
         # 评估 BCSR coreset 选择的收敛质量
-        # convergence = compute_convergence_score(loss_list)
-        # print(f"  ├─ Convergence Score: {convergence['score']:.4f} ({convergence['status']})")
-        # print(f"  ├─ Initial Loss: {convergence['details']['initial_loss']:.4f}")
-        # print(f"  ├─ Final Loss: {convergence['details']['final_loss']:.4f}")
-        # print(f"  └─ Total Decrease: {convergence['details']['total_decrease']:.4f}")
+        convergence = compute_convergence_score(loss_list)
+        print(f"  ├─ Convergence Score: {convergence['score']:.4f} ({convergence['status']})")
+        print(f"  ├─ Initial Loss: {convergence['details']['initial_loss']:.4f}")
+        print(f"  ├─ Final Loss: {convergence['details']['final_loss']:.4f}")
+        print(f"  └─ Total Decrease: {convergence['details']['total_decrease']:.4f}")
 
-        # # 记录到 TensorBoard
-        # if tb_writer is not None:
-        #     tb_writer.add_scalar('bcsr/convergence_score', convergence['score'])
-        #     tb_writer.add_scalar('bcsr/convergence_decrease', convergence['details']['decrease'])
-        #     tb_writer.add_scalar('bcsr/convergence_monotonicity', convergence['details']['monotonicity'])
-        #     tb_writer.add_scalar('bcsr/convergence_stability', convergence['details']['stability'])
+        # 记录到 TensorBoard
+        if tb_writer is not None:
+            tb_writer.add_scalar('bcsr/convergence_score', convergence['score'])
+            tb_writer.add_scalar('bcsr/convergence_decrease', convergence['details']['decrease'])
+            tb_writer.add_scalar('bcsr/convergence_monotonicity', convergence['details']['monotonicity'])
+            tb_writer.add_scalar('bcsr/convergence_stability', convergence['details']['stability'])
 
-        # # 保存收敛指标并终止程序
-        # print("\n" + "="*70)
-        # print("CONVERGENCE METRICS COLLECTED - TERMINATING PROGRAM")
-        # print("="*70)
-        # print(f"Score: {convergence['score']:.4f}")
-        # print(f"Status: {convergence['status']}")
-        # print(f"Decrease Rate: {convergence['details']['decrease']:.4f}")
-        # print(f"Monotonicity: {convergence['details']['monotonicity']:.4f}")
-        # print(f"Stability: {convergence['details']['stability']:.4f}")
-        # print(f"Oscillation Score: {convergence['details']['oscillation']:.4f}")
-        # print("="*70 + "\n")
+        # 保存收敛指标并终止程序
+        print("\n" + "="*70)
+        print("CONVERGENCE METRICS COLLECTED - TERMINATING PROGRAM")
+        print("="*70)
+        print(f"Score: {convergence['score']:.4f}")
+        print(f"Status: {convergence['status']}")
+        print(f"Decrease Rate: {convergence['details']['decrease']:.4f}")
+        print(f"Monotonicity: {convergence['details']['monotonicity']:.4f}")
+        print(f"Stability: {convergence['details']['stability']:.4f}")
+        print(f"Oscillation Score: {convergence['details']['oscillation']:.4f}")
+        print("="*70 + "\n")
 
-        # # 保存到文件
-        # import json
-        # convergence_file = f'{args.log_dir}/{args.exp_name}/convergence_metrics.json'
-        # os.makedirs(os.path.dirname(convergence_file), exist_ok=True)
-        # with open(convergence_file, 'w') as f:
-        #     json.dump(convergence, f, indent=2)
-        # print(f"Convergence metrics saved to: {convergence_file}")
+        # 保存到文件
+        import json
+        convergence_file = f'{args.log_dir}/{args.exp_name}/convergence_metrics.json'
+        os.makedirs(os.path.dirname(convergence_file), exist_ok=True)
+        with open(convergence_file, 'w') as f:
+            json.dump(convergence, f, indent=2)
+        print(f"Convergence metrics saved to: {convergence_file}")
 
         # 终止程序
-    
-    
+        import sys
+        sys.exit(0)
+
 
     elif method=="mix":
         # 混合策略：先用 maxrand 粗略筛选，再用 kibo 精细筛选
@@ -645,6 +787,15 @@ def one_fold(args, fold=0):
     # 初始化结果存储和已见类别跟踪
     results = []
     seen_classes = np.empty(0, dtype=int)
+
+    # ====== 加载预训练模型 checkpoint ======
+    ckpt_path = f'ckpt/fold_{fold}_task_0.pt'
+    if os.path.exists(ckpt_path):
+        print(f'Loading checkpoint from {ckpt_path}')
+        model.load_state_dict(torch.load(ckpt_path))
+        print(f'Checkpoint loaded successfully!')
+    else:
+        print(f'Warning: Checkpoint not found at {ckpt_path}, using randomly initialized model')
 
     # ====== 2. 任务序列训练主循环 ======
     for task in range(args.n_tasks):
@@ -754,83 +905,34 @@ def one_fold(args, fold=0):
                 # ====== 3.1.2.1 TransMIL模型前向传播和损失计算 ======
                 if args.net == 'transmil':
                     # 前向传播
-                    out = model(batch['features'])
+                    out = model(batch['features'], return_attn=True) if hasattr(args, 'cl_method') and args.cl_method == 'prev' and task > 0 else model(batch['features'])
                     # 掩码未见类别的输出（防止模型对未见类别产生高置信度预测）
                     out['logits'][:, unseen_classes] = -100
-                    # 计算分类损失
-                    loss = F.cross_entropy(out['logits'], batch['label'])
-
-                    # ====== 持续学习损失计算（当前任务数据） ======
-                    if hasattr(args, 'cl_method') and args.cl_on_current:
-                        if args.cl_method == 'LwF' and task > 0:
-                            # Learning without Forgetting: 知识蒸馏损失
-                            old_out = old_model(batch['features'])
-                            kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            loss = loss + kd_loss
-                            logger_batch.update({'kd_loss': kd_loss.item()})
-                        elif args.cl_method == 'MICIL' and task > 0:
-                            # MICIL: 知识蒸馏 + 特征蒸馏
-                            old_out = old_model(batch['features'])
-                            kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            em_loss = F.mse_loss(out['features'], old_out['features'])
-                            loss = loss + 10 * kd_loss + em_loss
-                            logger_batch.update({'kd_loss': 10 * kd_loss.item(), 'em_loss': em_loss.item()})
-                        elif args.cl_method == 'prev' and task > 0:
-                            # 注意力保持方法：保持注意力模式不变
-                            old_out = old_model(batch['features'], return_attn=True)
-                            # logits_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            attn_loss = kd_loss_fn(out['attn1'], old_out['attn1']) + kd_loss_fn(out['attn2'], old_out['attn2']) + \
-                                        F.mse_loss(out['h1'], old_out['h1']) + F.mse_loss(out['h2'], old_out['h2'])
-                            # em_loss = F.mse_loss(out['features'], old_out['features'])
-                            loss = loss + attn_loss
-                            logger_batch.update({'attn_loss': attn_loss.item()})
-
-                    # 更新训练损失并记录
-                    train_loss_metric.update(loss.item())
-                    logger_batch.update({'loss': loss.item()})
-                    logger.log_metrics(logger_batch)
 
                 # ====== 3.1.2.2 CLAM模型前向传播和损失计算 ======
                 elif args.net in ['clam_sb', 'clam_mb']:
-                    # print(batch['features'].device)
-                    # print(batch['label'])
-
                     # CLAM前向传播：包含包级别和实例级别预测
                     out = model(batch['features'], batch['label'], instance_eval=True, return_features=True, seen_classes=seen_classes)
-                    bag_loss = F.cross_entropy(out['logits'], batch['label'])  # 包级别损失
-                    inst_loss = out['instance_loss']  # 实例级别损失
-                    loss = 0.7*bag_loss + 0.3*inst_loss  # 加权组合
-
-                    # ====== 持续学习损失计算（当前任务数据） ======
-                    if hasattr(args, 'cl_method') and args.cl_on_current:
-                        if args.cl_method == 'LwF' and task > 0:
-                            # Learning without Forgetting: 知识蒸馏损失
-                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, seen_classes=old_seen_classes)
-                            kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            loss = loss + kd_loss
-                            logger_batch.update({'kd_loss': kd_loss.item()})
-                        elif args.cl_method == 'MICIL' and task > 0:
-                            # MICIL: 知识蒸馏 + 特征蒸馏
-                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
-                            kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            em_loss = F.mse_loss(out['features'], old_out['features'])
-                            loss = loss + 10 * kd_loss + em_loss
-                            logger_batch.update({'kd_loss': 10 * kd_loss.item(), 'em_loss': em_loss.item()})
-                        elif args.cl_method == 'prev' and task > 0:
-                            # 注意力保持方法：保持注意力权重不变
-                            old_out = old_model(batch['features'], batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
-                            # logits_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                            attn_loss = kd_loss_fn(out['A'], old_out['A'])  # 注意力权重蒸馏
-                            # em_loss = F.mse_loss(out['features'], old_out['z'])
-                            loss = loss + attn_loss
-                            logger_batch.update({'attn_loss': attn_loss.item()})
-
-                    # 更新训练损失并记录
-                    train_loss_metric.update(loss.item())
-                    logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item(), 'loss': loss.item()})
-                    logger.log_metrics(logger_batch)
                 else:
                     raise NotImplementedError
+
+                # ====== 3.1.2.3 统一损失计算 ======
+                loss, loss_dict = compute_loss(
+                    args=args,
+                    model=model,
+                    batch=batch,
+                    out=out,
+                    task=task,
+                    old_model=old_model if task > 0 else None,
+                    old_seen_classes=old_seen_classes if task > 0 else None,
+                    seen_classes=seen_classes,
+                    is_buffer_batch=False
+                )
+
+                # 更新训练损失并记录
+                train_loss_metric.update(loss.item())
+                logger_batch.update(loss_dict)
+                logger.log_metrics(logger_batch)
 
                 # ====== 3.1.2.3 反向传播和参数更新 ======
                 fabric.backward(loss)
@@ -862,83 +964,30 @@ def one_fold(args, fold=0):
                         old_batch = fabric.to_device(old_batch)
                         optimizer.zero_grad()
 
-                        # ====== 3.1.2.5.1 TransMIL缓冲区样本训练 ======
+                        # ====== 3.1.2.5.1 缓冲区样本前向传播 ======
                         if args.net == 'transmil':
                             out = model(old_batch['features'], return_attn=True)
                             out['logits'][:, unseen_classes] = -100
-                            loss = F.cross_entropy(out['logits'], old_batch['label'])
-
-                            if hasattr(args, 'cl_method'):
-                                if args.cl_method == 'LwF' and task > 0:
-                                    old_out = old_model(old_batch['features'])
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
-                                elif args.cl_method == 'derpp' and task > 0:
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_batch['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
-                                elif args.cl_method == 'MICIL' and task > 0:
-                                    old_out = old_model(old_batch['features'])
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    em_loss = F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + 10 * kd_loss + em_loss
-                                    logger_batch.update({'kd_loss': 10 * kd_loss.item(), 'em_loss': em_loss.item()})
-                                elif args.cl_method == 'prev' and task > 0:
-                                    old_out = old_model(old_batch['features'], return_attn=True)
-                                    p_loss = 0.
-                                    logits_loss = 10 * kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    attn_loss = 10 * (kd_loss_fn(out['attn1'], old_out['attn1'], ta=1) + kd_loss_fn(out['attn2'], old_out['attn2'], ta=1))
-                                    h_loss = 10 * (F.mse_loss(out['h1'], old_out['h1']) + F.mse_loss(out['h2'], old_out['h2']))
-                                    # p_loss +=  kd_loss_fn(out['vv1'], old_out['vv1']) + kd_loss_fn(out['vv2'], old_out['vv2'])
-                                    # p_loss += F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + logits_loss + attn_loss + h_loss
-                                    logger_batch.update({'logits_loss': logits_loss.item(), 'attn_loss': attn_loss.item(), 'h_loss': h_loss.item()})
-                                elif args.cl_method == 'ER':
-                                    pass
-                                else:
-                                    raise NotImplementedError
-
-                            train_loss_metric.update(loss.item())
                         elif args.net in ['clam_sb', 'clam_mb']:
                             out = model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=seen_classes)
-                            bag_loss = F.cross_entropy(out['logits'], old_batch['label'])
-                            inst_loss = out['instance_loss']
-                            loss = 0.7*bag_loss + 0.3*inst_loss
-                            logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item()})
-
-                            if hasattr(args, 'cl_method'):
-                                if args.cl_method == 'LwF' and task > 0:
-                                    old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
-                                elif args.cl_method == 'derpp' and task > 0:
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_batch['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
-                                elif args.cl_method == 'MICIL' and task > 0:
-                                    old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
-                                    kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    em_loss = F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + 10 * kd_loss + em_loss
-                                    logger_batch.update({'logits_loss': 10 * kd_loss.item(), 'features_loss': em_loss.item()})
-                                elif args.cl_method == 'prev' and task > 0:
-                                    old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
-                                    logits_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    attn_loss = kd_loss_fn(out['A'], old_out['A'])
-                                    loss = loss + attn_loss + 10 * logits_loss
-                                    logger_batch.update({'attn_loss': attn_loss.item(), 'logits_loss': 10 * logits_loss.item()})
-                                elif args.cl_method == 'ER':
-                                    pass
-                                else:
-                                    raise NotImplementedError
-
-                            train_loss_metric.update(loss.item())
                         else:
                             raise NotImplementedError
-                        
-                        logger_batch.update({'loss': loss.item()})
+
+                        # ====== 3.1.2.5.2 缓冲区样本损失计算 ======
+                        loss, loss_dict = compute_loss(
+                            args=args,
+                            model=model,
+                            batch=old_batch,
+                            out=out,
+                            task=task,
+                            old_model=old_model if task > 0 else None,
+                            old_seen_classes=old_seen_classes if task > 0 else None,
+                            seen_classes=seen_classes,
+                            is_buffer_batch=True
+                        )
+
+                        train_loss_metric.update(loss.item())
+                        logger_batch.update(loss_dict)
                         logger.log_metrics(logger_batch)
 
                         fabric.backward(loss)
@@ -1053,6 +1102,14 @@ def one_fold(args, fold=0):
             buffer.adjust_buffer_size_by_new_classes(len(cur_classes))
             n_seen_samples_per_task = min(args.buffer_size, len(train_loader))
 
+            # ====== 初始化slide挑选监控指标 ======
+            slide_selection_metrics = []
+            total_original_patches = 0
+            total_compressed_patches = 0
+            samples_with_selection = 0
+
+        
+
             # ====== 5.1 遍历训练数据并选择性添加到缓冲区 ======
             for batch_idx, batch in enumerate(train_loader):
                 # seed_everything(args.seed + batch_idx)
@@ -1061,11 +1118,39 @@ def one_fold(args, fold=0):
                 if buffer_idx == -1: continue  # 不添加当前样本
                 # ====== 5.2 样本特征压缩（可选） ======
                 # 如果配置了缓冲区样本大小限制，则对样本进行特征压缩
-                if args.buffer_slide_size > 0:
+
+
+                # ====== 5.3 DER++方法的logits存储 ======
+                # 如果使用DER++方法，需要存储当前模型的输出logits
+                if args.cl_method in ['derpp']:
+                    with torch.no_grad():
+                        batch = fabric.to_device(batch)
+                        if args.net in ['clam_sb', 'clam_mb']:
+                            out = model(batch['features'], batch['label'], seen_classes=seen_classes)
+                        elif args.net == 'transmil':
+                            out = model(batch['features'])
+                    batch['logits'] = out['logits']  # 保存logits用于未来的蒸馏
+
+                # ====== 5.4 将样本添加到缓冲区 ======
+                buffer.add(batch, buffer_idx)
+                # if batch_idx >= n_seen_samples_per_task:
+                #     break
+
+            if args.buffer_slide_size > 0:
+                
+                for batch_idx, batch in enumerate(buffer):
+                
                     # with torch.no_grad():
                     # 计算压缩后的特征大小
                     buffer_slide_size = args.buffer_slide_size * batch['features'].size(0) if isinstance(args.buffer_slide_size, float) else args.buffer_slide_size
                     batch = fabric.to_device(batch)
+
+                    # 记录原始patches数量
+                    original_patches = batch['features'].size(0)
+                    sample_label = batch['label'].item()
+
+                    # 开始计时
+                    slide_start_time = time.time()
 
                     # ====== 5.2.1 CLAM模型的特征蒸馏 ======
                     if args.net in ['clam_sb', 'clam_mb']:
@@ -1090,30 +1175,74 @@ def one_fold(args, fold=0):
                     else:
                         raise NotImplementedError
 
-                # ====== 5.3 DER++方法的logits存储 ======
-                # 如果使用DER++方法，需要存储当前模型的输出logits
-                if args.cl_method in ['derpp']:
-                    with torch.no_grad():
-                        batch = fabric.to_device(batch)
-                        if args.net in ['clam_sb', 'clam_mb']:
-                            out = model(batch['features'], batch['label'], seen_classes=seen_classes)
-                        elif args.net == 'transmil':
-                            out = model(batch['features'])
-                    batch['logits'] = out['logits']  # 保存logits用于未来的蒸馏
+                    # 结束计时并记录指标
+                    slide_end_time = time.time()
+                    compressed_patches = batch['features'].size(0)
+                    compression_ratio = compressed_patches / original_patches if original_patches > 0 else 0
 
-                # ====== 5.4 将样本添加到缓冲区 ======
-                buffer.add(batch, buffer_idx)
-                # if batch_idx >= n_seen_samples_per_task:
-                #     break
+                    # 累积统计数据
+                    total_original_patches += original_patches
+                    total_compressed_patches += compressed_patches
+                    samples_with_selection += 1
 
+                    # 记录当前样本的指标
+                    slide_selection_metrics.append({
+                        'batch_idx': batch_idx,
+                        'label': sample_label,
+                        'original_patches': original_patches,
+                        'compressed_patches': compressed_patches,
+                        'compression_ratio': compression_ratio,
+                        'selection_time_ms': (slide_end_time - slide_start_time) * 1000
+                    })
+            
+            
+            
+            
             # ====== 5.5 缓冲区状态记录 ======
             print(f'Buffer size: {len(buffer)}')
             print(f'Number of patches in buffer: {buffer.n_patches_total}')
             print(f'Labels in buffer: {buffer.labels}')
+            # 确保目录存在
+            os.makedirs(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}', exist_ok=True)
             # 保存缓冲区类别分布到CSV文件
             with open(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
+
+            # ====== 5.6 Slide挑选统计指标计算和保存 ======
+            if samples_with_selection > 0:
+                avg_original_patches = total_original_patches / samples_with_selection
+                avg_compressed_patches = total_compressed_patches / samples_with_selection
+                avg_compression_ratio = avg_compressed_patches / avg_original_patches if avg_original_patches > 0 else 0
+                total_selection_time = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / 1000  # 转换为秒
+                avg_selection_time_ms = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / samples_with_selection
+
+                # 打印统计信息
+                print(f'\n===== Slide Selection Statistics =====')
+                print(f'Samples with slide selection: {samples_with_selection}')
+                print(f'Average original patches: {avg_original_patches:.2f}')
+                print(f'Average compressed patches: {avg_compressed_patches:.2f}')
+                print(f'Average compression ratio: {avg_compression_ratio:.4f}')
+                print(f'Total slide selection time: {total_selection_time:.2f} seconds')
+                print(f'Average selection time per sample: {avg_selection_time_ms:.2f} ms')
+                print(f'======================================\n')
+
+                # 保存详细指标到CSV文件
+                slide_metrics_df = pd.DataFrame(slide_selection_metrics)
+                slide_metrics_df.to_csv(
+                    f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/slide_selection_details.csv',
+                    index=False
+                )
+
+                # 记录到logger
+                logger.log_metrics({
+                    'slide_samples_count': samples_with_selection,
+                    'slide_avg_original_patches': avg_original_patches,
+                    'slide_avg_compressed_patches': avg_compressed_patches,
+                    'slide_avg_compression_ratio': avg_compression_ratio,
+                    'slide_total_selection_time_seconds': total_selection_time,
+                    'slide_avg_selection_time_ms': avg_selection_time_ms
+                })
 
             # 结束监控并记录
             buffer_end_time = time.time()
@@ -1190,7 +1319,8 @@ def one_fold(args, fold=0):
 
         # 记录任务完成状态
         logger.finalize(f"Success on fold {fold} task {task}!")
-
+        
+        exit()
     # ====== 8. 返回所有任务的测试结果 ======
     return results # [{'fold': 0, 'task': 0, '0_auc': 0.9, '0_acc': 0.8}, {...}, ...]
 
@@ -1548,6 +1678,8 @@ def main(args):
     
 if __name__ == '__main__':
     args = init_args()
+
+    # 删除 logs 目录
 
     if args.testing:
         test(args)

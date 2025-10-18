@@ -112,11 +112,7 @@ class SimpleBuffer():
 
     def __len__(self):
         return len(self.buffer)
-
-    def __iter__(self):
-        """支持迭代遍历 buffer 中的所有样本"""
-        return iter(self.buffer)
-
+    
 
 class ClsssIncrementalBuffer():
     def __init__(self, buffer_size, device='cpu', **kwargs):
@@ -216,12 +212,6 @@ class ClsssIncrementalBuffer():
 
     def __len__(self):
         return sum(len(samples) for samples in self.buffers.values())
-
-    def __iter__(self):
-        """支持迭代遍历 buffer 中的所有样本"""
-        for samples in self.buffers.values():
-            for sample in samples:
-                yield sample
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
@@ -370,88 +360,6 @@ def load_model(args):
 
     return model
 
-def compute_convergence_score(loss_list):
-    """
-    计算损失序列的收敛得分
-
-    参数:
-        loss_list: 损失序列 (list)
-
-    返回:
-        dict: 包含收敛得分和状态的字典
-    """
-    import numpy as np
-
-    if len(loss_list) < 2:
-        return {
-            'score': 0.0,
-            'status': 'Insufficient data',
-            'details': {}
-        }
-
-    losses = np.array(loss_list)
-
-    # 1. 总体下降率
-    total_decrease = losses[0] - losses[-1]
-    relative_decrease = total_decrease / (abs(losses[0]) + 1e-10)
-    decrease_score = np.clip(relative_decrease, 0, 1)
-
-    # 2. 单调性得分（损失是否持续下降）
-    gradients = np.diff(losses)
-    decreasing_steps = np.sum(gradients < 0)
-    monotonicity_score = decreasing_steps / len(gradients) if len(gradients) > 0 else 0
-
-    # 3. 最近稳定性（最后几步的波动）
-    window_size = min(5, len(losses))
-    recent_losses = losses[-window_size:]
-    recent_std = np.std(recent_losses)
-    recent_mean = np.mean(recent_losses)
-    recent_cv = recent_std / (abs(recent_mean) + 1e-10)
-    stability_score = 1.0 / (1.0 + recent_cv)
-
-    # 4. 振荡指标（来回振荡的程度）
-    if len(gradients) > 1:
-        sign_changes = np.sum(np.diff(np.sign(gradients)) != 0)
-        oscillation_index = sign_changes / (len(gradients) - 1)
-        oscillation_score = 1 - oscillation_index
-    else:
-        oscillation_score = 1.0
-
-    # 综合得分（加权平均）
-    convergence_score = (
-        0.3 * decrease_score +      # 总体下降 30%
-        0.3 * monotonicity_score +   # 单调性 30%
-        0.2 * stability_score +      # 稳定性 20%
-        0.2 * oscillation_score      # 无振荡 20%
-    )
-
-    # 判断收敛状态
-    if convergence_score >= 0.8:
-        status = 'Excellent'
-    elif convergence_score >= 0.6:
-        status = 'Good'
-    elif convergence_score >= 0.4:
-        status = 'Fair'
-    elif convergence_score >= 0.2:
-        status = 'Poor'
-    else:
-        status = 'Very Poor'
-
-    return {
-        'score': float(convergence_score),
-        'status': status,
-        'details': {
-            'decrease': float(decrease_score),
-            'monotonicity': float(monotonicity_score),
-            'stability': float(stability_score),
-            'oscillation': float(oscillation_score),
-            'initial_loss': float(losses[0]),
-            'final_loss': float(losses[-1]),
-            'total_decrease': float(total_decrease),
-            'loss_history': losses.tolist()
-        }
-    }
-
 def kd_loss_fn(train_logits, prev_logits, ta = 2, softmax = True):
     """
     KD_LOSS: Compute distillation loss between output of the current model and the output of the previous (saved) model.
@@ -477,6 +385,10 @@ import copy
 # todo:关键，从一个大的patch 里面挑选出子集
 def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=None,task_id=None,seen_classes=None,tb_writer=None):
     assert len(slide.shape) == 2, f"slide shape: {slide.shape}"
+    
+    
+    print(f"Distilling slide from {slide.size(0)} to {size} patches using method '{method}'")
+    
     size = int(min(size, slide.size(0)))
     if method == 'random':
         idx = torch.randperm(slide.size(0))[:size]
@@ -499,6 +411,10 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         rand_ids = torch.randperm(slide.size(0))[:size].to(top_p_ids.device)
         idx = torch.cat((top_p_ids, rand_ids))
     elif method=="kibo":
+        # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
+        # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
+        # size = size // 2
+        # coreset_select(self, model, X, y, task_id, topk, out_loss=None, ref_x=None, ref_y=None):
         proxy_model=copy.deepcopy(model)
         for param in proxy_model.parameters():
             param.requires_grad = True
@@ -512,58 +428,13 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
                             weight_lr=args.bcsr_weight_lr,
                             distall_lamda=args.distall_lamda,
                             tb_writer=tb_writer,
-                            draw_curve=args.draw_curve,
-                            topk=size,
-                            topk_method=args.topk_method,
-                            topk_temperature=args.topk_temperature,
-                            normalize_method=args.normalize_method,
-                            use_simplex_projection=args.use_simplex_projection,
-                            distill_target=args.distill_target)
+                            draw_curve=args.draw_curve)
         # 优化：直接传递 GPU tensor，避免 CPU-GPU 来回传输
-        idx, loss_list = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
+        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
                                                  topk=size, seen_classes=seen_classes)
 
         # idx 已经在正确的设备上，确保与 slide 设备一致
         idx = idx.to(slide.device)
-
-        # 评估 BCSR coreset 选择的收敛质量
-        # convergence = compute_convergence_score(loss_list)
-        # print(f"  ├─ Convergence Score: {convergence['score']:.4f} ({convergence['status']})")
-        # print(f"  ├─ Initial Loss: {convergence['details']['initial_loss']:.4f}")
-        # print(f"  ├─ Final Loss: {convergence['details']['final_loss']:.4f}")
-        # print(f"  └─ Total Decrease: {convergence['details']['total_decrease']:.4f}")
-
-        # # 记录到 TensorBoard
-        # if tb_writer is not None:
-        #     tb_writer.add_scalar('bcsr/convergence_score', convergence['score'])
-        #     tb_writer.add_scalar('bcsr/convergence_decrease', convergence['details']['decrease'])
-        #     tb_writer.add_scalar('bcsr/convergence_monotonicity', convergence['details']['monotonicity'])
-        #     tb_writer.add_scalar('bcsr/convergence_stability', convergence['details']['stability'])
-
-        # # 保存收敛指标并终止程序
-        # print("\n" + "="*70)
-        # print("CONVERGENCE METRICS COLLECTED - TERMINATING PROGRAM")
-        # print("="*70)
-        # print(f"Score: {convergence['score']:.4f}")
-        # print(f"Status: {convergence['status']}")
-        # print(f"Decrease Rate: {convergence['details']['decrease']:.4f}")
-        # print(f"Monotonicity: {convergence['details']['monotonicity']:.4f}")
-        # print(f"Stability: {convergence['details']['stability']:.4f}")
-        # print(f"Oscillation Score: {convergence['details']['oscillation']:.4f}")
-        # print("="*70 + "\n")
-
-        # # 保存到文件
-        # import json
-        # convergence_file = f'{args.log_dir}/{args.exp_name}/convergence_metrics.json'
-        # os.makedirs(os.path.dirname(convergence_file), exist_ok=True)
-        # with open(convergence_file, 'w') as f:
-        #     json.dump(convergence, f, indent=2)
-        # print(f"Convergence metrics saved to: {convergence_file}")
-
-        # 终止程序
-    
-    
-
     elif method=="mix":
         # 混合策略：先用 maxrand 粗略筛选，再用 kibo 精细筛选
         # 第一阶段：使用 maxrand 粗略筛选出较多的候选样本（例如 mix_coarse_ratio*size）
@@ -592,12 +463,7 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
             weight_lr=args.bcsr_weight_lr,
             distall_lamda=args.distall_lamda,
             draw_curve=args.draw_curve,
-            tb_writer=tb_writer,
-            topk_method=args.topk_method,
-            topk_temperature=args.topk_temperature,
-            normalize_method=args.normalize_method,
-            use_simplex_projection=args.use_simplex_projection,
-            distill_target=args.distill_target)
+            tb_writer=tb_writer)
 
         # 在候选样本中进行精细筛选
         fine_idx, outer_loss = BCSR_Coreset_selector.coreset_select(
@@ -645,6 +511,15 @@ def one_fold(args, fold=0):
     # 初始化结果存储和已见类别跟踪
     results = []
     seen_classes = np.empty(0, dtype=int)
+
+    # ====== 加载预训练模型 checkpoint ======
+    ckpt_path = f'ckpt/fold_{fold}_task_0.pt'
+    if os.path.exists(ckpt_path):
+        print(f'Loading checkpoint from {ckpt_path}')
+        model.load_state_dict(torch.load(ckpt_path))
+        print(f'Checkpoint loaded successfully!')
+    else:
+        print(f'Warning: Checkpoint not found at {ckpt_path}, using randomly initialized model')
 
     # ====== 2. 任务序列训练主循环 ======
     for task in range(args.n_tasks):
@@ -1053,6 +928,12 @@ def one_fold(args, fold=0):
             buffer.adjust_buffer_size_by_new_classes(len(cur_classes))
             n_seen_samples_per_task = min(args.buffer_size, len(train_loader))
 
+            # ====== 初始化slide挑选监控指标 ======
+            slide_selection_metrics = []
+            total_original_patches = 0
+            total_compressed_patches = 0
+            samples_with_selection = 0
+
             # ====== 5.1 遍历训练数据并选择性添加到缓冲区 ======
             for batch_idx, batch in enumerate(train_loader):
                 # seed_everything(args.seed + batch_idx)
@@ -1066,6 +947,13 @@ def one_fold(args, fold=0):
                     # 计算压缩后的特征大小
                     buffer_slide_size = args.buffer_slide_size * batch['features'].size(0) if isinstance(args.buffer_slide_size, float) else args.buffer_slide_size
                     batch = fabric.to_device(batch)
+
+                    # 记录原始patches数量
+                    original_patches = batch['features'].size(0)
+                    sample_label = batch['label'].item()
+
+                    # 开始计时
+                    slide_start_time = time.time()
 
                     # ====== 5.2.1 CLAM模型的特征蒸馏 ======
                     if args.net in ['clam_sb', 'clam_mb']:
@@ -1090,6 +978,26 @@ def one_fold(args, fold=0):
                     else:
                         raise NotImplementedError
 
+                    # 结束计时并记录指标
+                    slide_end_time = time.time()
+                    compressed_patches = batch['features'].size(0)
+                    compression_ratio = compressed_patches / original_patches if original_patches > 0 else 0
+
+                    # 累积统计数据
+                    total_original_patches += original_patches
+                    total_compressed_patches += compressed_patches
+                    samples_with_selection += 1
+
+                    # 记录当前样本的指标
+                    slide_selection_metrics.append({
+                        'batch_idx': batch_idx,
+                        'label': sample_label,
+                        'original_patches': original_patches,
+                        'compressed_patches': compressed_patches,
+                        'compression_ratio': compression_ratio,
+                        'selection_time_ms': (slide_end_time - slide_start_time) * 1000
+                    })
+
                 # ====== 5.3 DER++方法的logits存储 ======
                 # 如果使用DER++方法，需要存储当前模型的输出logits
                 if args.cl_method in ['derpp']:
@@ -1110,10 +1018,47 @@ def one_fold(args, fold=0):
             print(f'Buffer size: {len(buffer)}')
             print(f'Number of patches in buffer: {buffer.n_patches_total}')
             print(f'Labels in buffer: {buffer.labels}')
+            # 确保目录存在
+            os.makedirs(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}', exist_ok=True)
             # 保存缓冲区类别分布到CSV文件
             with open(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
+
+            # ====== 5.6 Slide挑选统计指标计算和保存 ======
+            if samples_with_selection > 0:
+                avg_original_patches = total_original_patches / samples_with_selection
+                avg_compressed_patches = total_compressed_patches / samples_with_selection
+                avg_compression_ratio = avg_compressed_patches / avg_original_patches if avg_original_patches > 0 else 0
+                total_selection_time = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / 1000  # 转换为秒
+                avg_selection_time_ms = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / samples_with_selection
+
+                # 打印统计信息
+                print(f'\n===== Slide Selection Statistics =====')
+                print(f'Samples with slide selection: {samples_with_selection}')
+                print(f'Average original patches: {avg_original_patches:.2f}')
+                print(f'Average compressed patches: {avg_compressed_patches:.2f}')
+                print(f'Average compression ratio: {avg_compression_ratio:.4f}')
+                print(f'Total slide selection time: {total_selection_time:.2f} seconds')
+                print(f'Average selection time per sample: {avg_selection_time_ms:.2f} ms')
+                print(f'======================================\n')
+
+                # 保存详细指标到CSV文件
+                slide_metrics_df = pd.DataFrame(slide_selection_metrics)
+                slide_metrics_df.to_csv(
+                    f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/slide_selection_details.csv',
+                    index=False
+                )
+
+                # 记录到logger
+                logger.log_metrics({
+                    'slide_samples_count': samples_with_selection,
+                    'slide_avg_original_patches': avg_original_patches,
+                    'slide_avg_compressed_patches': avg_compressed_patches,
+                    'slide_avg_compression_ratio': avg_compression_ratio,
+                    'slide_total_selection_time_seconds': total_selection_time,
+                    'slide_avg_selection_time_ms': avg_selection_time_ms
+                })
 
             # 结束监控并记录
             buffer_end_time = time.time()

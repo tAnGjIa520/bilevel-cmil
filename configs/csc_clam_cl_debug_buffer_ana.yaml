@@ -38,7 +38,7 @@ opt: adam
 lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4] # float or list
 weight_decay: 0.
 seed: 1
-epochs: [40, 50, 50] # int or list
+epochs: [0, 50, 50] # int or list
 # epochs: [1, 1, 1] # int or list
 testing: False
 load: null
@@ -48,22 +48,31 @@ folds_end: -1
 
 # cl setting
 cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
-buffer_size: 42  # 42
+
 buffer_balance: False
-buffer_slide_size: 200 # n_patches in a pseudo slide
+
+buffer_size: 1  # 42
+buffer_slide_size: 50 # n_patches in a pseudo slide
 #distill_method: 'maxmin' # 'max', 'random', 'maxmin', mix
-distill_method: 'mix'
+distill_method: 'kibo'
 mix_coarse_ratio: 2.0  # for mix method: coarse selection size = mix_coarse_ratio * final_size
 wn: False
 cl_on_current: False
 
-# BCSR Coreset hyperparameters
-bcsr_lr_proxy_model: 5  # learning rate for proxy model
-bcsr_beta: 0.1  # beta parameter
-
-bcsr_max_outer_it: 3  # maximum outer iterations
+# BCSR Coreset hyperparameters (Best configuration - Score: 0.7167)
+bcsr_lr_proxy_model: 1.0  # learning rate for proxy model
+bcsr_beta: 0.01  # beta parameter
+bcsr_max_outer_it: 10  # maximum outer iterations
 bcsr_max_inner_it: 1  # maximum inner iterations
-bcsr_weight_lr: 10  # weight learning rate
+bcsr_weight_lr: 0.01  # weight learning rate
+distall_lamda: 0.1
+topk_method: 'gumbel'  # 'sigmoid', 'gumbel', 'ste'
+topk_temperature: 0.5  # temperature for topk selection
+normalize_method: 'zscore'  # 'l2', 'softmax', 'zscore', 'none'
+use_simplex_projection: False  # whether to project weights onto simplex
+distill_target: 'features'  # knowledge distillation target: 'logits', 'features', 'both'
 
-distall_lamda : 0.1
+
+
+
 draw_curve : False
