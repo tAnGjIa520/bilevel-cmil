@@ -1,69 +1,132 @@
-# proj setting
-project: 'CMIL'
-exp_name: 'csc_clam_cl'
-wandb_mode: 'disabled' # 'online', 'offline', 'disabled'
-log_dir: 'logs' # directory for saving logs and checkpoints
+# ======================== Project Settings ========================
+project: 'CMIL'                           # Project name
+exp_name: 'csc_clam_cl'                   # Experiment name
+wandb_mode: 'disabled'                    # WandB logging mode: 'online', 'offline', 'disabled'
+log_dir: 'logs'                           # Directory for logs and checkpoints
 
-# model setting
-model: clam_sb # clam_sb, clam_mb
-net: 'clam_sb'
-D_feat: 512
-L: 512
-D: 256
-K: 1 # clam_sb: 1, clam_mb: n_classes
-dropout: True
-gate: True
-k_sample: 8
-subtyping: True
-instance_loss_name: 'svm'
-bag_weight: 0.7
-feature_extractor: null
+# ======================== Model Settings ========================
+model: clam_sb                            # Model type: clam_sb (single branch), clam_mb (multi-branch)
+net: 'clam_sb'                            # Network architecture
+D_feat: 512                               # Feature dimension
+L: 512                                    # Hidden layer dimension
+D: 256                                    # Another dimension
+K: 1                                      # Number of attention heads (clam_sb: 1, clam_mb: n_classes)
+dropout: True                             # Whether to use dropout
+gate: True                                # Whether to use gating mechanism
+k_sample: 8                               # Number of sampled patches
+subtyping: True                           # Whether to perform subtype classification
+instance_loss_name: 'svm'                 # Instance-level loss function type
+bag_weight: 0.7                           # Bag-level loss weight (instance weight = 1 - bag_weight)
+feature_extractor: null                   # Feature extractor (null means use built-in)
 
-# dataset setting
-dataset: 'csc_cl'
-data_root: '/mnt/nfs/zhangjinouwen/tangjia/cmil/bilevel-cmil/data'
-feat_dir: 'embeddings'
-classes_order: ['2', '4', '0', '5', '3', '1']
-n_folds: 1
-n_classes: 6
-n_tasks: 3 # 2, 3, 5
+# ======================== Dataset Settings ========================
+dataset: 'csc_cl'                         # Dataset name
+data_root: './skin_data'                       # Data root directory
+feat_dir: 'embeddings'                    # Feature storage directory
+classes_order: ['2', '4', '0', '5', '3', '1']  # Class order
+n_folds: 1                                # Number of cross-validation folds
+n_classes: 6                              # Total number of classes
+n_tasks: 3                                # Number of tasks (task rounds in continual learning)
 
-# train setting
-batch_size: 1
-weighted_sample: False
-n_batches: -1
-early_stop: False
-patience: 10
-opt: adam
-lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4] # float or list
-weight_decay: 0.
-seed: 1
-epochs: [40, 50, 50] # int or list
-# epochs: [1, 1, 1] # int or list
-testing: False
-load: null
-debug: 'False' # False, lite/True (quick check), full (run a few steps)
-folds_start: -1
-folds_end: -1
+# ======================== Training Settings ========================
+batch_size: 1                             # Batch size
+weighted_sample: False                    # Whether to use weighted sampling
+n_batches: -1                             # Maximum batches per epoch (-1 means all)
+early_stop: False                         # Whether to use early stopping
+patience: 10                              # Early stopping patience (epochs without improvement)
+opt: adam                                 # [Main model training] Optimizer: adam or sgd
+lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4]       # [Main model training] Learning rate list (one value per task)
+weight_decay: 0.                          # Weight decay coefficient (L2 regularization)
+seed: 200                                 # Random seed
+epochs: [40, 50, 50]                       # Training epochs per task
+# epochs: [1, 1, 1]                       # For debugging: quick test epochs
+testing: False                            # Whether to only test (no training)
+load: null                                # Pretrained model path to load (null means no loading)
+debug: 'False'                            # Debug mode: 'False' (normal), 'lite' (10 steps), 'full' (20 steps)
+folds_start: -1                           # Starting fold (-1 for auto)
+folds_end: -1                             # Ending fold (-1 for auto)
 
-# cl setting
-cl_method: 'prev' # 'none', 'finetune', 'ewc', 'replay', 'full-replay', 'joint'
-buffer_size: 42  # 42
-buffer_balance: True
-buffer_slide_size: 200 # n_patches in a pseudo slide
-#distill_method: 'maxmin' # 'max', 'random', 'maxmin', mix
-distill_method: 'mix'
-mix_coarse_ratio: 2.0  # for mix method: coarse selection size = mix_coarse_ratio * final_size
-wn: False
-cl_on_current: False
 
-# BCSR Coreset hyperparameters
-bcsr_lr_proxy_model: 5  # learning rate for proxy model
-bcsr_beta: 0.1  # beta parameter
+# ======================== Continual Learning Settings ========================
+cl_method: 'prev'                         # CL method: 'none', 'finetune', 'ewc', 'replay', 'prev' (attention preservation)
+buffer_balance: False                     # Whether buffer is class-balanced
 
-bcsr_max_outer_it: 3  # maximum outer iterations
-bcsr_max_inner_it: 1  # maximum inner iterations
-bcsr_weight_lr: 10  # weight learning rate
+# Buffer capacity configuration
+avg_instances_per_bag: 562                 # Average number of instances per original bag
+full_bag_buffer_size: 42                   # How many full bags can be stored
+buffer_slide_size: 100                     # Number of instances per pseudo-bag (compressed)
+# buffer_size will be auto-calculated: ceil(42×562/100)=237
+#distill_method: 'maxmin'                 # Sample selection methods: 'max', 'random', 'maxmin', 'mix'
+distill_method: 'kibo'                    # Current selection method: 'kibo' (bilevel optimization-based coreset)
+mix_coarse_ratio: mix                     # Coarse selection ratio for mix method (coarse = fine × ratio)
+wn: False                                 # Whether to use weight normalization (prevents feature drift)
+cl_on_current: False                      # Whether to apply CL loss on current task data
 
-distall_lamda : 0.1
-draw_curve : False
+# ======================== BCSR Coreset Hyperparameters ========================
+bcsr_lr_proxy_model: 1.0                  # [Inner opt] Proxy model learning rate (optimizing θ)
+bcsr_beta: 0.01                           # [Inner opt] Balance hyperparameter (loss vs regularization)
+bcsr_max_outer_it: 10                     # Max outer iterations (sample weight update count)
+bcsr_max_inner_it: 3                     # [Inner opt] Max inner iterations (optimization steps per weight update)
+bcsr_neumann_series_depth: 5              # [Inner opt] Neumann series depth Q (2nd-order gradient approximation)
+bcsr_weight_lr: 10                      # [Outer opt] Sample weight learning rate (optimizing w) ⚠️ Redundant, will be removed
+distall_lamda: 1                        # [Inner opt] Lagrange multiplier for knowledge distillation loss
+topk_method: 'gumbel'                     # [Inner opt] TopK selection: 'sigmoid', 'gumbel', 'ste'
+topk_temperature: 0.5                     # [Inner opt] Temperature for TopK selection (controls softness)
+normalize_method: 'none'                # [Inner opt] Weight normalization: 'l2', 'softmax', 'zscore', 'none'
+use_simplex_projection: False              # [Inner opt] Whether to project weights to simplex (probability constraint)
+distill_target: 'features'                # [Inner opt] Distillation target: 'logits', 'features', 'both'
+
+# ======================== Temperature Scheduler Config ========================
+use_temp_scheduler: False                 # Whether to enable adaptive temperature scheduling
+temp_initial: 2.0                         # Initial temperature (high = soft selection, more exploration)
+temp_final: 1                           # Final temperature (low = hard selection, faster convergence)
+temp_strategy: 'cosine'                   # Temperature decay strategy: 'linear', 'cosine', 'exponential'
+
+# ======================== Weight Optimizer Config ========================
+# [Bilevel Optimization] Outer Loop - Optimizing sample weights w
+weight_optimizer_type: 'sgd'              # [Outer opt] Optimizer type: 'sgd' or 'adam'
+weight_adam_lr: 200                     # [Outer opt] Weight optimizer initial learning rate (optimizing w)
+weight_adam_betas: [0.9, 0.999]           # [Outer opt] Adam beta parameters (momentum coefficients: [β1, β2])
+weight_adam_eps: 1e-8                     # [Outer opt] Adam epsilon parameter (numerical stability)
+
+# ======================== Learning Rate Scheduler Config ========================
+# [Bilevel Optimization] Outer loop LR decay - Controls dynamic LR changes for sample weights w
+use_lr_scheduler: False                   # [Outer opt] Whether to enable LR scheduling for weight optimizer
+lr_initial: 0.001                         # [Outer opt] Initial learning rate (default: weight_adam_lr)
+lr_final: 0.0001                          # [Outer opt] Final learning rate (decay target)
+lr_strategy: 'cosine'                     # [Outer opt] LR decay strategy: 'linear', 'cosine', 'exponential'
+
+# ======================== Visualization Settings ========================
+draw_curve: False                         # Whether to draw convergence curves
+
+# ======================== Coreset Weight Initialization Config ========================
+# Initialization methods: 'uniform_random', 'uniform_equal', 'gaussian',
+#                        'attention_based', 'entropy_based', 'hybrid'
+coreset_weight_init: 'uniform_random'    # Current initialization method
+init_hyperparams:                         # Hyperparameters for initialization methods
+  # Uniform random parameters
+  low: 0.0                                # Lower bound of random range
+  high: 1.0                               # Upper bound of random range
+
+  # Uniform equal weight parameters
+  base_value: null                        # null means 1/n, otherwise use specified value
+
+  # Gaussian distribution parameters
+  mean: 0.5                               # Mean of normal distribution
+  std: 0.2                                # Standard deviation of normal distribution
+  activation: 'sigmoid'                   # Activation function: 'sigmoid' or 'relu'
+
+  # Attention-based parameters
+  aggregation: 'mean'                     # Aggregation method: 'mean', 'max', 'weighted_mean'
+  normalize: True                         # Whether to normalize
+  temperature: 1.0                        # Temperature parameter (higher = smoother)
+
+  # Entropy-based parameters
+  normalization: 'minmax'                 # Normalization method: 'minmax' or 'softmax'
+  inverse: True                           # Low entropy high weight (True) or high entropy high weight (False)
+  eps: 1e-8                               # Numerical stability parameter
+
+  # Hybrid method parameters
+  attention_weight: 0.7                   # Attention weight ratio
+  entropy_weight: 0.3                     # Entropy weight ratio
+

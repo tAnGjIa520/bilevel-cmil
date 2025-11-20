@@ -1,10 +1,11 @@
 """
 可微分的 Top-K Selection 算子
 
-提供三种实现方法:
+提供四种实现方法:
 1. SigmoidTopK - 使用 Sigmoid + 动态阈值（推荐）
 2. GumbelTopK - 使用 Gumbel 噪声增强
 3. STETopK - 使用 Straight-Through Estimator
+4. SoftTopK - 使用 Tanh 平滑激活函数的柔和选择
 
 作者: Claude
 日期: 2024
@@ -242,6 +243,78 @@ class STETopK(nn.Module):
         output = hard + (soft - soft.detach())
 
         return output
+
+    def extra_repr(self) -> str:
+        return f'k={self.k}, temperature={self.temperature}, dim={self.dim}'
+
+
+class SoftTopK(nn.Module):
+    """
+    使用 Tanh 平滑激活函数的柔和 Top-K 选择
+
+    原理:
+    1. 找到第 k 大的值作为阈值
+    2. 使用 Tanh 将 (w - threshold) 映射到 [-1, 1]
+    3. 进一步映射到 [0, 1] 范围
+    4. Top-K 项的 w > threshold, tanh 输出接近 1
+    5. 其他项的 w < threshold, tanh 输出接近 -1 → 0
+
+    优点:
+    - 完全可微分
+    - 输出更平滑，不像 Sigmoid 那样"硬"
+    - 温度可调
+    - 适合需要渐进式选择的场景
+
+    参数:
+        k (int): 选择的 top 数量
+        temperature (float): 温度参数，越小输出越"硬"
+                            默认 0.1，推荐范围 [0.01, 1.0]
+        dim (int): 在哪个维度上选择 top-k，默认 -1（最后一维）
+
+    示例:
+        >>> topk = SoftTopK(k=5, temperature=0.1)
+        >>> w = torch.randn(100, requires_grad=True)
+        >>> selection = topk(w)
+        >>> print(selection.shape)  # torch.Size([100])
+        >>> print(selection.max(), selection.min())  # 接近 1.0 和 0.0，但更平滑
+    """
+
+    def __init__(self, k: int, temperature: float = 0.1, dim: int = -1):
+        super(SoftTopK, self).__init__()
+        self.k = k
+        self.temperature = temperature
+        self.dim = dim
+
+    def forward(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+
+        Args:
+            w: 输入权重，shape: (..., n)
+
+        Returns:
+            selection: Top-K 选择结果，shape 与 w 相同
+                      Top-K 项接近 1，其他项接近 0，但输出更平滑
+        """
+        # 获取第 k 大的值作为阈值
+        size = w.size(self.dim)
+        kth = size - self.k + 1
+
+        # 计算阈值
+        threshold = torch.kthvalue(w, kth, dim=self.dim, keepdim=True).values
+
+        # 使用 Tanh 进行更柔和的平滑选择
+        # Tanh 的输出在 [-1, 1]，然后映射到 [0, 1]
+        # (w - threshold) / temperature:
+        #   - Top-K 项: w > threshold, 值为正，tanh → 接近 1
+        #   - 其他项: w < threshold, 值为负，tanh → 接近 -1
+        #   - temperature 越小，tanh 越陡峭
+        tanh_output = torch.tanh((w - threshold) / self.temperature)
+
+        # 将 [-1, 1] 映射到 [0, 1]
+        scores = (tanh_output + 1) / 2
+
+        return scores
 
     def extra_repr(self) -> str:
         return f'k={self.k}, temperature={self.temperature}, dim={self.dim}'

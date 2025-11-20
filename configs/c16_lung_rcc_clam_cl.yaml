@@ -67,3 +67,32 @@ bcsr_candidate_batch_size: 600  # candidate batch size
 bcsr_logging_period: 1000  # logging period
 distall_lamda : 0.1
 draw_curve : False
+
+# Coreset weight initialization configuration
+coreset_weight_init: 'attention_based'    # initialization method: 'uniform_random', 'uniform_equal', 'gaussian', 'attention_based', 'entropy_based', 'hybrid'
+init_hyperparams:                         # hyperparameters for initialization method
+  # uniform_random parameters
+  low: 0.0                                # lower bound of random range
+  high: 1.0                               # upper bound of random range
+
+  # uniform_equal parameters
+  base_value: null                        # null means 1/n, otherwise use specified value
+
+  # gaussian parameters
+  mean: 0.5                               # mean of normal distribution
+  std: 0.2                                # std of normal distribution
+  activation: 'sigmoid'                   # activation function: 'sigmoid' or 'relu'
+
+  # attention_based parameters
+  aggregation: 'mean'                     # aggregation method: 'mean', 'max', 'weighted_mean'
+  normalize: True                         # whether to normalize
+  temperature: 1.0                        # temperature parameter (larger = smoother)
+
+  # entropy_based parameters
+  normalization: 'minmax'                 # normalization method: 'minmax' or 'softmax'
+  inverse: True                           # low entropy high weight (True) or high entropy high weight (False)
+  eps: 1e-8                               # numerical stability parameter
+
+  # hybrid method parameters
+  attention_weight: 0.7                   # attention weight ratio
+  entropy_weight: 0.3                     # entropy weight ratio

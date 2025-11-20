@@ -24,6 +24,8 @@ from tools.cl_metrics import compute_all_folds_metrics
 from tools.print_metrics import print_cl_metrics_table
 import time
 from tools.tb import AutoStepWriter
+import pickle
+import matplotlib.pyplot as plt
 
 
 # use pure pytorch instead of pytorch-lightning
@@ -594,15 +596,55 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
                             init_hyperparams=getattr(args, 'init_hyperparams', {}),
                             neumann_series_depth=getattr(args, 'bcsr_neumann_series_depth', 3))
         # 优化：直接传递 GPU tensor，避免 CPU-GPU 来回传输
-        
         idx, loss_list, inner_loss_list = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
                                                  topk=size, seen_classes=seen_classes)
         # 注意：inner_loss_list 接收但在 main_cl.py 中不使用
 
         # idx 已经在正确的设备上，确保与 slide 设备一致
         idx = idx.to(slide.device)
+
+        # 评估 BCSR coreset 选择的收敛质量
+        # convergence = compute_convergence_score(loss_list)
+        # print(f"  ├─ Convergence Score: {convergence['score']:.4f} ({convergence['status']})")
+        # print(f"  ├─ Initial Loss: {convergence['details']['initial_loss']:.4f}")
+        # print(f"  ├─ Final Loss: {convergence['details']['final_loss']:.4f}")
+        # print(f"  └─ Total Decrease: {convergence['details']['total_decrease']:.4f}")
+
+        # # 记录到 TensorBoard
+        # if tb_writer is not None:
+        #     tb_writer.add_scalar('bcsr/convergence_score', convergence['score'])
+        #     tb_writer.add_scalar('bcsr/convergence_decrease', convergence['details']['decrease'])
+        #     tb_writer.add_scalar('bcsr/convergence_monotonicity', convergence['details']['monotonicity'])
+        #     tb_writer.add_scalar('bcsr/convergence_stability', convergence['details']['stability'])
+
+        # # 保存收敛指标并终止程序
+        # print("\n" + "="*70)
+        # print("CONVERGENCE METRICS COLLECTED - TERMINATING PROGRAM")
+        # print("="*70)
+        # print(f"Score: {convergence['score']:.4f}")
+        # print(f"Status: {convergence['status']}")
+        # print(f"Decrease Rate: {convergence['details']['decrease']:.4f}")
+        # print(f"Monotonicity: {convergence['details']['monotonicity']:.4f}")
+        # print(f"Stability: {convergence['details']['stability']:.4f}")
+        # print(f"Oscillation Score: {convergence['details']['oscillation']:.4f}")
+        # print("="*70 + "\n")
+
+        # # 保存到文件
+        # import json
+        # convergence_file = f'{args.log_dir}/{args.exp_name}/convergence_metrics.json'
+        # os.makedirs(os.path.dirname(convergence_file), exist_ok=True)
+        # with open(convergence_file, 'w') as f:
+        #     json.dump(convergence, f, indent=2)
+        # print(f"Convergence metrics saved to: {convergence_file}")
+
+        # 终止程序
+    
+    
+
     elif method=="mix":
-        
+        # 混合策略：先用 maxrand 粗略筛选，再用 kibo 精细筛选
+        # 第一阶段：使用 maxrand 粗略筛选出较多的候选样本（例如 mix_coarse_ratio*size）
+
         mix_coarse_ratio = getattr(args, 'mix_coarse_ratio', 2)  # 默认粗选是精选的2倍
         coarse_size = int(min(size * mix_coarse_ratio, slide.size(0)))  # 粗选样本数量
         coarse_size = coarse_size // 2  # maxrand 内部会除以2
@@ -700,6 +742,16 @@ def one_fold(args, fold=0):
     # 初始化结果存储和已见类别跟踪
     results = []
     seen_classes = np.empty(0, dtype=int)
+
+    # ====== 初始化全局更新计数器和梯度范数记录 ======
+    global_update_step = 0
+    gradient_norms_history = {
+        'update_step': [],
+        'attn_grad_norm_current': [],
+        'attn_grad_norm_accumulated': [],
+        'buffer_samples_used': [],
+        'task_id': []
+    }
 
     # ====== 2. 任务序列训练主循环 ======
     for task in range(args.n_tasks):
@@ -891,22 +943,21 @@ def one_fold(args, fold=0):
                 else:
                     raise NotImplementedError
 
-                # ====== 3.1.2.3 反向传播和参数更新 ======
+                # ====== 3.1.2.3 反向传播（先不更新参数，等待梯度累积） ======
                 fabric.backward(loss)
-                optimizer.step()
 
-                # ====== 3.1.2.4 权重归一化（防止表示漂移） ======
-                if args.wn and task > 0 and hasattr(args, 'cl_method'):
-                    with torch.no_grad():
-                        if args.net == 'transmil':
-                            model._fc2.weight.data = F.normalize(model._fc2.weight.data)
-                        elif args.net in ['clam_sb', 'clam_mb']:
-                            model.classifiers.weight.data = F.normalize(model.classifiers.weight.data)
-                        else:
-                            raise NotImplementedError
+                # ====== 统计当前batch的梯度范数 ======
+                attn_grad_norm_current = None
+                if args.net in ['clam_sb', 'clam_mb']:
+                    attention_c = model.attention_net[-1].attention_c
+                    if attention_c.weight.grad is not None:
+                        attn_grad_norm_current = torch.norm(attention_c.weight.grad, p=2).item()
+                        logger_batch.update({'attn_grad_norm_current': attn_grad_norm_current})
+                        logger.log_metrics({'attn_grad_norm_current': attn_grad_norm_current, 'epoch': i, 'batch': batch_idx})
 
-                # ====== 3.1.2.5 内存缓冲区回放训练 ======
+                # ====== 3.1.2.4 内存缓冲区回放训练（累积梯度） ======
                 # 从第二个任务开始，使用缓冲区中的历史样本进行回放训练
+                buffer_update_count = 0
                 if task > 0 and hasattr(args, 'cl_method') and hasattr(args, 'buffer_size') and args.buffer_size > 0:
                     # 每个epoch开始时重置缓冲区采样顺序
                     if batch_idx == 0: buffer.start_epoch()
@@ -917,101 +968,124 @@ def one_fold(args, fold=0):
                         old_batch = buffer.get_next_batch()
                         if old_batch is None: raise StopIteration  # 缓冲区样本已全部遍历完
                         old_batch = old_batch[0]
-                        logger_batch = {'epoch': i, 'batch': batch_idx}
+                        logger_batch_buffer = {'epoch': i, 'batch': batch_idx}
                         old_batch = fabric.to_device(old_batch)
-                        optimizer.zero_grad()
+                        # 注意：这里不做 optimizer.zero_grad()，让梯度累积
 
                         # ====== 3.1.2.5.1 TransMIL缓冲区样本训练 ======
                         if args.net == 'transmil':
                             out = model(old_batch['features'], return_attn=True)
                             out['logits'][:, unseen_classes] = -100
-                            loss = F.cross_entropy(out['logits'], old_batch['label'])
+                            loss_buffer = F.cross_entropy(out['logits'], old_batch['label'])
 
                             if hasattr(args, 'cl_method'):
                                 if args.cl_method == 'LwF' and task > 0:
                                     old_out = old_model(old_batch['features'])
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
+                                    loss_buffer = loss_buffer + kd_loss
+                                    logger_batch_buffer.update({'logits_loss': kd_loss.item()})
                                 elif args.cl_method == 'derpp' and task > 0:
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_batch['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
+                                    loss_buffer = loss_buffer + kd_loss
+                                    logger_batch_buffer.update({'logits_loss': kd_loss.item()})
                                 elif args.cl_method == 'MICIL' and task > 0:
                                     old_out = old_model(old_batch['features'])
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
                                     em_loss = F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + 10 * kd_loss + em_loss
-                                    logger_batch.update({'kd_loss': 10 * kd_loss.item(), 'em_loss': em_loss.item()})
+                                    loss_buffer = loss_buffer + 10 * kd_loss + em_loss
+                                    logger_batch_buffer.update({'kd_loss': 10 * kd_loss.item(), 'em_loss': em_loss.item()})
                                 elif args.cl_method == 'prev' and task > 0:
                                     old_out = old_model(old_batch['features'], return_attn=True)
-                                    p_loss = 0.
                                     logits_loss = 10 * kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
                                     attn_loss = 10 * (kd_loss_fn(out['attn1'], old_out['attn1'], ta=1) + kd_loss_fn(out['attn2'], old_out['attn2'], ta=1))
                                     h_loss = 10 * (F.mse_loss(out['h1'], old_out['h1']) + F.mse_loss(out['h2'], old_out['h2']))
-                                    # p_loss +=  kd_loss_fn(out['vv1'], old_out['vv1']) + kd_loss_fn(out['vv2'], old_out['vv2'])
-                                    # p_loss += F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + logits_loss + attn_loss + h_loss
-                                    logger_batch.update({'logits_loss': logits_loss.item(), 'attn_loss': attn_loss.item(), 'h_loss': h_loss.item()})
+                                    loss_buffer = loss_buffer + logits_loss + attn_loss + h_loss
+                                    logger_batch_buffer.update({'logits_loss': logits_loss.item(), 'attn_loss': attn_loss.item(), 'h_loss': h_loss.item()})
                                 elif args.cl_method == 'ER':
                                     pass
                                 else:
                                     raise NotImplementedError
 
-                            train_loss_metric.update(loss.item())
+                            train_loss_metric.update(loss_buffer.item())
                         elif args.net in ['clam_sb', 'clam_mb']:
                             out = model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=seen_classes)
                             bag_loss = F.cross_entropy(out['logits'], old_batch['label'])
                             inst_loss = out['instance_loss']
-                            loss = 0.7*bag_loss + 0.3*inst_loss
-                            logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item()})
+                            loss_buffer = 0.7*bag_loss + 0.3*inst_loss
+                            logger_batch_buffer.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item()})
 
                             if hasattr(args, 'cl_method'):
                                 if args.cl_method == 'LwF' and task > 0:
                                     old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
+                                    loss_buffer = loss_buffer + kd_loss
+                                    logger_batch_buffer.update({'logits_loss': kd_loss.item()})
                                 elif args.cl_method == 'derpp' and task > 0:
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_batch['logits'][:, old_seen_classes])
-                                    loss = loss + kd_loss
-                                    logger_batch.update({'logits_loss': kd_loss.item()})
+                                    loss_buffer = loss_buffer + kd_loss
+                                    logger_batch_buffer.update({'logits_loss': kd_loss.item()})
                                 elif args.cl_method == 'MICIL' and task > 0:
                                     old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
                                     kd_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
                                     em_loss = F.mse_loss(out['features'], old_out['features'])
-                                    loss = loss + 10 * kd_loss + em_loss
-                                    logger_batch.update({'logits_loss': 10 * kd_loss.item(), 'features_loss': em_loss.item()})
+                                    loss_buffer = loss_buffer + 10 * kd_loss + em_loss
+                                    logger_batch_buffer.update({'logits_loss': 10 * kd_loss.item(), 'features_loss': em_loss.item()})
                                 elif args.cl_method == 'prev' and task > 0:
                                     old_out = old_model(old_batch['features'], old_batch['label'], instance_eval=True, return_features=True, seen_classes=old_seen_classes)
                                     logits_loss = kd_loss_fn(out['logits'][:, old_seen_classes], old_out['logits'][:, old_seen_classes])
                                     attn_loss = kd_loss_fn(out['A'], old_out['A'])
-                                    loss = loss + attn_loss + 10 * logits_loss
-                                    logger_batch.update({'attn_loss': attn_loss.item(), 'logits_loss': 10 * logits_loss.item()})
+                                    loss_buffer = loss_buffer + attn_loss + 10 * logits_loss
+                                    logger_batch_buffer.update({'attn_loss': attn_loss.item(), 'logits_loss': 10 * logits_loss.item()})
                                 elif args.cl_method == 'ER':
                                     pass
                                 else:
                                     raise NotImplementedError
 
-                            train_loss_metric.update(loss.item())
+                            train_loss_metric.update(loss_buffer.item())
                         else:
                             raise NotImplementedError
-                        
-                        logger_batch.update({'loss': loss.item()})
-                        logger.log_metrics(logger_batch)
 
-                        fabric.backward(loss)
-                        optimizer.step()
+                        logger_batch_buffer.update({'loss': loss_buffer.item()})
+                        logger.log_metrics(logger_batch_buffer)
 
-                        if args.wn and task > 0 and hasattr(args, 'cl_method'):
-                            with torch.no_grad():
-                                if args.net == 'transmil':
-                                    model._fc2.weight.data = F.normalize(model._fc2.weight.data)
-                                elif args.net in ['clam_sb', 'clam_mb']:
-                                    model.classifiers.weight.data = F.normalize(model.classifiers.weight.data)
-                                else:
-                                    raise NotImplementedError
-                                    
+                        # 累积梯度，不清零也不更新参数
+                        fabric.backward(loss_buffer)
+                        buffer_update_count += 1
+
+                # ====== 3.1.2.5 统计累积后的总梯度范数 ======
+                attn_grad_norm_accumulated = None
+                if args.net in ['clam_sb', 'clam_mb']:
+                    attention_c = model.attention_net[-1].attention_c
+                    if attention_c.weight.grad is not None:
+                        attn_grad_norm_accumulated = torch.norm(attention_c.weight.grad, p=2).item()
+                        logger_metrics_final = {
+                            'attn_grad_norm_accumulated': attn_grad_norm_accumulated,
+                            'buffer_samples_used': buffer_update_count,
+                            'epoch': i,
+                            'batch': batch_idx
+                        }
+                        logger.log_metrics(logger_metrics_final)
+
+                        # ====== 记录到全局历史数据 ======
+                        gradient_norms_history['update_step'].append(global_update_step)
+                        gradient_norms_history['attn_grad_norm_current'].append(attn_grad_norm_current if attn_grad_norm_current is not None else 0.0)
+                        gradient_norms_history['attn_grad_norm_accumulated'].append(attn_grad_norm_accumulated)
+                        gradient_norms_history['buffer_samples_used'].append(buffer_update_count)
+                        gradient_norms_history['task_id'].append(task)
+
+                # ====== 3.1.2.6 权重归一化（防止表示漂移）======
+                if args.wn and task > 0 and hasattr(args, 'cl_method'):
+                    with torch.no_grad():
+                        if args.net == 'transmil':
+                            model._fc2.weight.data = F.normalize(model._fc2.weight.data)
+                        elif args.net in ['clam_sb', 'clam_mb']:
+                            model.classifiers.weight.data = F.normalize(model.classifiers.weight.data)
+                        else:
+                            raise NotImplementedError
+
+                # ====== 3.1.2.7 统一参数更新（仅更新一次） ======
+                optimizer.step()
+                global_update_step += 1  # ====== 更新全局计数器 ======
 
             # ====== 3.2 验证阶段 ======
             model.eval()
@@ -1145,7 +1219,7 @@ def one_fold(args, fold=0):
                         attn = (attn2 + 1) * (attn1 + 1) / 4  # 组合两层注意力
                         attn = attn.mean(dim=0, keepdim=True).view(1, -1)
                         # 基于注意力权重选择代表性特征
-                        slide = distill_slide(batch['features'], attn, size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'],seen_classes=seen_classes,tb_writer=tb_writer)
+                        slide = distill_slide(batch['features'], attn, size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'],tb_writer=tb_writer)
                         batch['features'] = slide
                     else:
                         raise NotImplementedError
@@ -1253,7 +1327,162 @@ def one_fold(args, fold=0):
         # 记录任务完成状态
         logger.finalize(f"Success on fold {fold} task {task}!")
 
-    # ====== 8. 返回所有任务的测试结果 ======
+        # ====== 7.3 保存梯度范数历史数据 ======
+        if args.net in ['clam_sb', 'clam_mb'] and len(gradient_norms_history['update_step']) > 0:
+            os.makedirs(f'{args.log_dir}/{args.exp_name}/gradient_analysis', exist_ok=True)
+
+            # 保存为 pickle 文件
+            with open(f'{args.log_dir}/{args.exp_name}/gradient_analysis/gradient_norms_task_{task}.pkl', 'wb') as f:
+                pickle.dump(gradient_norms_history, f)
+
+            # 也保存为 CSV 文件方便查看
+            df_grad = pd.DataFrame(gradient_norms_history)
+            df_grad.to_csv(f'{args.log_dir}/{args.exp_name}/gradient_analysis/gradient_norms_task_{task}.csv', index=False)
+
+            print(f"[梯度分析] 任务 {task} 梯度范数数据已保存")
+            print(f"  - Pickle: gradient_norms_task_{task}.pkl ({len(gradient_norms_history['update_step'])} 条记录)")
+            print(f"  - CSV: gradient_norms_task_{task}.csv")
+
+    # ====== 8. 绘制梯度范数演化图表 ======
+    if args.net in ['clam_sb', 'clam_mb']:
+        # 从保存的数据中加载所有任务的梯度范数历史
+        gradient_data_all_tasks = {}
+        gradient_dir = f'{args.log_dir}/{args.exp_name}/gradient_analysis'
+
+        if os.path.exists(gradient_dir):
+            # 加载所有任务的数据
+            task_files = sorted([f for f in os.listdir(gradient_dir) if f.endswith('.pkl')])
+
+            for pkl_file in task_files:
+                task_id = int(pkl_file.split('_')[-1].replace('.pkl', ''))
+                with open(os.path.join(gradient_dir, pkl_file), 'rb') as f:
+                    gradient_data_all_tasks[task_id] = pickle.load(f)
+
+            if gradient_data_all_tasks:
+                # 合并所有任务数据
+                all_update_steps = []
+                all_current_norms = []
+                all_accumulated_norms = []
+                all_buffer_counts = []
+                all_task_ids = []
+                task_boundaries = []  # 记录任务边界
+
+                for task_id in sorted(gradient_data_all_tasks.keys()):
+                    data = gradient_data_all_tasks[task_id]
+                    all_update_steps.extend(data['update_step'])
+                    all_current_norms.extend(data['attn_grad_norm_current'])
+                    all_accumulated_norms.extend(data['attn_grad_norm_accumulated'])
+                    all_buffer_counts.extend(data['buffer_samples_used'])
+                    all_task_ids.extend(data['task_id'])
+
+                    # 记录任务边界（最后一个更新步骤）
+                    if data['update_step']:
+                        task_boundaries.append(max(data['update_step']))
+
+                # 创建三子图布局
+                fig, axes = plt.subplots(3, 1, figsize=(12, 8), dpi=300)
+                fig.suptitle('Attention Gradient Norms Evolution Across Tasks', fontsize=14, fontweight='bold')
+
+                # ====== 子图 1: 梯度范数随更新步数变化 ======
+                ax1 = axes[0]
+                ax1.plot(all_update_steps, all_current_norms, 'o-', label='Current Batch Gradient Norm',
+                        color='blue', markersize=3, linewidth=1.5, alpha=0.7)
+                ax1.plot(all_update_steps, all_accumulated_norms, 's-', label='Accumulated Gradient Norm',
+                        color='red', markersize=3, linewidth=1.5, alpha=0.7)
+
+                # 添加任务边界线
+                for boundary in task_boundaries[:-1]:  # 不包括最后一个边界
+                    ax1.axvline(x=boundary, color='green', linestyle='--', alpha=0.5, linewidth=1)
+
+                ax1.set_xlabel('Global Update Step', fontsize=11, fontweight='bold')
+                ax1.set_ylabel('Gradient Norm (L2)', fontsize=11, fontweight='bold')
+                ax1.set_title('Gradient Norms Over Training', fontsize=12, fontweight='bold')
+                ax1.legend(loc='best', fontsize=10)
+                ax1.grid(True, alpha=0.3)
+
+                # ====== 子图 2: 累积梯度 vs 当前梯度的比例 ======
+                ax2 = axes[1]
+                ratios = []
+                valid_indices = []
+                for i, (curr, accum) in enumerate(zip(all_current_norms, all_accumulated_norms)):
+                    if curr > 1e-6:  # 避免除以零
+                        ratios.append(accum / curr)
+                        valid_indices.append(all_update_steps[i])
+
+                ax2.plot(valid_indices, ratios, 'go-', label='Accumulated/Current Ratio',
+                        markersize=4, linewidth=1.5, alpha=0.7)
+
+                # 添加任务边界线
+                for boundary in task_boundaries[:-1]:
+                    ax2.axvline(x=boundary, color='green', linestyle='--', alpha=0.5, linewidth=1)
+
+                ax2.axhline(y=1.0, color='gray', linestyle=':', alpha=0.5, linewidth=1, label='Ratio = 1.0')
+                ax2.set_xlabel('Global Update Step', fontsize=11, fontweight='bold')
+                ax2.set_ylabel('Gradient Norm Ratio', fontsize=11, fontweight='bold')
+                ax2.set_title('Buffer Contribution to Total Gradient (Ratio > 1.0 = Buffer Contributes)',
+                             fontsize=12, fontweight='bold')
+                ax2.legend(loc='best', fontsize=10)
+                ax2.grid(True, alpha=0.3)
+
+                # ====== 子图 3: 缓冲区样本使用频率 ======
+                ax3 = axes[2]
+                # 统计每个任务中使用缓冲区样本的次数
+                task_buffer_usage = {}
+                for task_id, buffer_count in zip(all_task_ids, all_buffer_counts):
+                    if buffer_count > 0:
+                        if task_id not in task_buffer_usage:
+                            task_buffer_usage[task_id] = 0
+                        task_buffer_usage[task_id] += 1
+
+                if task_buffer_usage:
+                    tasks = sorted(task_buffer_usage.keys())
+                    usage_counts = [task_buffer_usage[t] for t in tasks]
+                    colors = plt.cm.viridis([(t % len(tasks)) / len(tasks) for t in tasks])
+
+                    bars = ax3.bar(tasks, usage_counts, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+
+                    # 在每个柱子上标注数值
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax3.text(bar.get_x() + bar.get_width()/2., height,
+                                f'{int(height)}',
+                                ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+                    ax3.set_xlabel('Task ID', fontsize=11, fontweight='bold')
+                    ax3.set_ylabel('Buffer Usage Frequency', fontsize=11, fontweight='bold')
+                    ax3.set_title('How Many Times Buffer Samples Were Used Per Task', fontsize=12, fontweight='bold')
+                    ax3.set_xticks(tasks)
+                    ax3.grid(True, alpha=0.3, axis='y')
+
+                plt.tight_layout()
+
+                # 保存图表
+                plot_save_path = os.path.join(gradient_dir, 'gradient_norms_evolution.png')
+                plt.savefig(plot_save_path, dpi=300, bbox_inches='tight')
+                print(f"\n[梯度分析] 梯度范数演化图已保存: {plot_save_path}")
+
+                # 保存汇总数据为 CSV
+                summary_df = pd.DataFrame({
+                    'global_update_step': all_update_steps,
+                    'attn_grad_norm_current': all_current_norms,
+                    'attn_grad_norm_accumulated': all_accumulated_norms,
+                    'buffer_samples_used': all_buffer_counts,
+                    'task_id': all_task_ids
+                })
+                summary_csv_path = os.path.join(gradient_dir, 'gradient_norms_summary.csv')
+                summary_df.to_csv(summary_csv_path, index=False)
+                print(f"[梯度分析] 梯度范数汇总数据已保存: {summary_csv_path}")
+
+                # 打印统计信息
+                print(f"\n[梯度分析统计]")
+                print(f"  - 总更新步数: {len(all_update_steps)}")
+                print(f"  - 涉及任务数: {len(gradient_data_all_tasks)}")
+                print(f"  - 当前批次梯度范数范围: [{min(all_current_norms):.6f}, {max(all_current_norms):.6f}]")
+                print(f"  - 累积梯度范数范围: [{min(all_accumulated_norms):.6f}, {max(all_accumulated_norms):.6f}]")
+
+                plt.close()
+
+    # ====== 9. 返回所有任务的测试结果 ======
     return results # [{'fold': 0, 'task': 0, '0_auc': 0.9, '0_acc': 0.8}, {...}, ...]
 
 

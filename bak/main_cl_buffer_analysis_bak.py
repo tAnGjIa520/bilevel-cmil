@@ -112,11 +112,7 @@ class SimpleBuffer():
 
     def __len__(self):
         return len(self.buffer)
-
-    def __iter__(self):
-        """支持迭代遍历 buffer 中的所有样本"""
-        return iter(self.buffer)
-
+    
 
 class ClsssIncrementalBuffer():
     def __init__(self, buffer_size, device='cpu', **kwargs):
@@ -217,12 +213,6 @@ class ClsssIncrementalBuffer():
     def __len__(self):
         return sum(len(samples) for samples in self.buffers.values())
 
-    def __iter__(self):
-        """支持迭代遍历 buffer 中的所有样本"""
-        for samples in self.buffers.values():
-            for sample in samples:
-                yield sample
-
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
     def __init__(self, patience=20, stop_epoch=50, verbose=False):
@@ -279,14 +269,6 @@ def add_argument(parser, name, value):
         elif isinstance(value, list):
             # 对于列表类型，使用自定义的解析函数
             parser.add_argument(f'--{name}', type=parse_list_arg, default=value)
-        elif isinstance(value, str):
-            # 处理来自 YAML 的字符串格式的科学计数法 (例如 '1e-8' → 1e-8)
-            try:
-                float_value = float(value)
-                parser.add_argument(f'--{name}', type=float, default=float_value)
-            except ValueError:
-                # 如果转换失败，保持为字符串
-                parser.add_argument(f'--{name}', type=str, default=value)
         else:
             parser.add_argument(f'--{name}', type=type(value), default=value)
 
@@ -337,31 +319,6 @@ def init_args():
         else:
             args.folds_end = 1
 
-    # 自动计算 buffer_size（基于完整bag容量）
-    if hasattr(args, 'full_bag_buffer_size') and hasattr(args, 'avg_instances_per_bag') and hasattr(args, 'buffer_slide_size'):
-        import math
-
-        # 计算总容量（以instance为单位）
-        total_buffer_instances = args.full_bag_buffer_size * args.avg_instances_per_bag
-
-        # 计算可以存多少个伪包
-        args.buffer_size = math.ceil(total_buffer_instances / args.buffer_slide_size)
-
-        # 计算压缩率和效率提升
-        compression_ratio = args.buffer_slide_size / args.avg_instances_per_bag * 100
-        efficiency_gain = args.buffer_size / args.full_bag_buffer_size
-
-        print(f"\n{'='*70}")
-        print(f"Buffer Configuration:")
-        print(f"  Full-bag buffer capacity: {args.full_bag_buffer_size} bags")
-        print(f"  Avg instances per original bag: {args.avg_instances_per_bag}")
-        print(f"  Total buffer capacity: {total_buffer_instances} instances")
-        print(f"  Instances per pseudo-bag: {args.buffer_slide_size}")
-        print(f"  → Auto-calculated buffer_size: {args.buffer_size} pseudo-bags")
-        print(f"  Compression ratio: {compression_ratio:.2f}%")
-        print(f"  Efficiency gain: {efficiency_gain:.2f}x")
-        print(f"{'='*70}\n")
-
     print(args)
     return args
 
@@ -403,88 +360,6 @@ def load_model(args):
 
     return model
 
-def compute_convergence_score(loss_list):
-    """
-    计算损失序列的收敛得分
-
-    参数:
-        loss_list: 损失序列 (list)
-
-    返回:
-        dict: 包含收敛得分和状态的字典
-    """
-    import numpy as np
-
-    if len(loss_list) < 2:
-        return {
-            'score': 0.0,
-            'status': 'Insufficient data',
-            'details': {}
-        }
-
-    losses = np.array(loss_list)
-
-    # 1. 总体下降率
-    total_decrease = losses[0] - losses[-1]
-    relative_decrease = total_decrease / (abs(losses[0]) + 1e-10)
-    decrease_score = np.clip(relative_decrease, 0, 1)
-
-    # 2. 单调性得分（损失是否持续下降）
-    gradients = np.diff(losses)
-    decreasing_steps = np.sum(gradients < 0)
-    monotonicity_score = decreasing_steps / len(gradients) if len(gradients) > 0 else 0
-
-    # 3. 最近稳定性（最后几步的波动）
-    window_size = min(5, len(losses))
-    recent_losses = losses[-window_size:]
-    recent_std = np.std(recent_losses)
-    recent_mean = np.mean(recent_losses)
-    recent_cv = recent_std / (abs(recent_mean) + 1e-10)
-    stability_score = 1.0 / (1.0 + recent_cv)
-
-    # 4. 振荡指标（来回振荡的程度）
-    if len(gradients) > 1:
-        sign_changes = np.sum(np.diff(np.sign(gradients)) != 0)
-        oscillation_index = sign_changes / (len(gradients) - 1)
-        oscillation_score = 1 - oscillation_index
-    else:
-        oscillation_score = 1.0
-
-    # 综合得分（加权平均）
-    convergence_score = (
-        0.3 * decrease_score +      # 总体下降 30%
-        0.3 * monotonicity_score +   # 单调性 30%
-        0.2 * stability_score +      # 稳定性 20%
-        0.2 * oscillation_score      # 无振荡 20%
-    )
-
-    # 判断收敛状态
-    if convergence_score >= 0.8:
-        status = 'Excellent'
-    elif convergence_score >= 0.6:
-        status = 'Good'
-    elif convergence_score >= 0.4:
-        status = 'Fair'
-    elif convergence_score >= 0.2:
-        status = 'Poor'
-    else:
-        status = 'Very Poor'
-
-    return {
-        'score': float(convergence_score),
-        'status': status,
-        'details': {
-            'decrease': float(decrease_score),
-            'monotonicity': float(monotonicity_score),
-            'stability': float(stability_score),
-            'oscillation': float(oscillation_score),
-            'initial_loss': float(losses[0]),
-            'final_loss': float(losses[-1]),
-            'total_decrease': float(total_decrease),
-            'loss_history': losses.tolist()
-        }
-    }
-
 def kd_loss_fn(train_logits, prev_logits, ta = 2, softmax = True):
     """
     KD_LOSS: Compute distillation loss between output of the current model and the output of the previous (saved) model.
@@ -511,8 +386,8 @@ import copy
 def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=None,task_id=None,seen_classes=None,tb_writer=None):
     assert len(slide.shape) == 2, f"slide shape: {slide.shape}"
     
-    print("slide={}".format(size))
-    # exit(0)
+    
+    print(f"Distilling slide from {slide.size(0)} to {size} patches using method '{method}'")
     
     size = int(min(size, slide.size(0)))
     if method == 'random':
@@ -536,33 +411,13 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         rand_ids = torch.randperm(slide.size(0))[:size].to(top_p_ids.device)
         idx = torch.cat((top_p_ids, rand_ids))
     elif method=="kibo":
+        # 模型 输入数据x 输出数据y，任务(用于key alue 映射) ，选择几个，outer loss是什么
+        # def coreset_select(self, model, X, y, task_id,  topk, out_loss=None, ref_x=None, ref_y=None):
+        # size = size // 2
+        # coreset_select(self, model, X, y, task_id, topk, out_loss=None, ref_x=None, ref_y=None):
         proxy_model=copy.deepcopy(model)
         for param in proxy_model.parameters():
             param.requires_grad = True
-
-        # 创建 temperature scheduler（如果启用）
-        temp_scheduler = None
-        if hasattr(args, 'use_temp_scheduler') and args.use_temp_scheduler:
-            from tools.temperature_scheduler import TemperatureScheduler
-            temp_scheduler = TemperatureScheduler(
-                initial_temp=getattr(args, 'temp_initial', 2.0),
-                final_temp=getattr(args, 'temp_final', 0.5),
-                max_iterations=args.bcsr_max_outer_it,
-                strategy=getattr(args, 'temp_strategy', 'cosine')
-            )
-
-        # 创建 learning rate scheduler（如果启用）
-        lr_scheduler = None
-        if hasattr(args, 'use_lr_scheduler') and args.use_lr_scheduler:
-            from tools.lr_scheduler import LearningRateScheduler
-            lr_init = getattr(args, 'lr_initial', None) or args.weight_adam_lr
-            lr_fin = getattr(args, 'lr_final', None) or (args.weight_adam_lr * 0.1)
-            lr_scheduler = LearningRateScheduler(
-                initial_lr=lr_init,
-                final_lr=lr_fin,
-                max_iterations=args.bcsr_max_outer_it,
-                strategy=getattr(args, 'lr_strategy', 'cosine')
-            )
 
         BCSR_Coreset_selector = BCSR_Coreset(
                             proxy_model,
@@ -573,35 +428,16 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
                             weight_lr=args.bcsr_weight_lr,
                             distall_lamda=args.distall_lamda,
                             tb_writer=tb_writer,
-                            draw_curve=args.draw_curve,
-                            topk=size,
-                            topk_method=args.topk_method,
-                            topk_temperature=args.topk_temperature,
-                            normalize_method=args.normalize_method,
-                            use_simplex_projection=args.use_simplex_projection,
-                            distill_target=args.distill_target,
-                            temp_scheduler=temp_scheduler,
-                            weight_optimizer_type=getattr(args, 'weight_optimizer_type', 'sgd'),
-                            weight_adam_lr=getattr(args, 'weight_adam_lr', 0.001),
-                            weight_adam_betas=getattr(args, 'weight_adam_betas', (0.9, 0.999)),
-                            weight_adam_eps=getattr(args, 'weight_adam_eps', 1e-8),
-                            use_lr_scheduler=getattr(args, 'use_lr_scheduler', False),
-                            lr_initial=getattr(args, 'lr_initial', None),
-                            lr_final=getattr(args, 'lr_final', None),
-                            lr_strategy=getattr(args, 'lr_strategy', 'cosine'),
-                            coreset_weight_init=getattr(args, 'coreset_weight_init', 'uniform_random'),
-                            model_type=args.net,
-                            init_hyperparams=getattr(args, 'init_hyperparams', {}),
-                            neumann_series_depth=getattr(args, 'bcsr_neumann_series_depth', 3))
+                            draw_curve=args.draw_curve)
         # 优化：直接传递 GPU tensor，避免 CPU-GPU 来回传输
-        
-        idx, loss_list, inner_loss_list = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
+        idx, outer_loss = BCSR_Coreset_selector.coreset_select(proxy_model, slide, label, task_id=task_id,
                                                  topk=size, seen_classes=seen_classes)
-        # 注意：inner_loss_list 接收但在 main_cl.py 中不使用
 
         # idx 已经在正确的设备上，确保与 slide 设备一致
         idx = idx.to(slide.device)
     elif method=="mix":
+        # 混合策略：先用 maxrand 粗略筛选，再用 kibo 精细筛选
+        # 第一阶段：使用 maxrand 粗略筛选出较多的候选样本（例如 mix_coarse_ratio*size）
         
         mix_coarse_ratio = getattr(args, 'mix_coarse_ratio', 2)  # 默认粗选是精选的2倍
         coarse_size = int(min(size * mix_coarse_ratio, slide.size(0)))  # 粗选样本数量
@@ -618,17 +454,6 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
         for param in proxy_model.parameters():
             param.requires_grad = True
 
-        # 创建 temperature scheduler（如果启用）
-        temp_scheduler = None
-        if hasattr(args, 'use_temp_scheduler') and args.use_temp_scheduler:
-            from tools.temperature_scheduler import TemperatureScheduler
-            temp_scheduler = TemperatureScheduler(
-                initial_temp=getattr(args, 'temp_initial', 2.0),
-                final_temp=getattr(args, 'temp_final', 0.5),
-                max_iterations=args.bcsr_max_outer_it,
-                strategy=getattr(args, 'temp_strategy', 'cosine')
-            )
-
         BCSR_Coreset_selector = BCSR_Coreset(
             proxy_model,
             lr_proxy_model=args.bcsr_lr_proxy_model,
@@ -638,21 +463,7 @@ def distill_slide(slide, attn=None, size=1e5, method='random',model=None,label=N
             weight_lr=args.bcsr_weight_lr,
             distall_lamda=args.distall_lamda,
             draw_curve=args.draw_curve,
-            tb_writer=tb_writer,
-            topk_method=args.topk_method,
-            topk_temperature=args.topk_temperature,
-            normalize_method=args.normalize_method,
-            use_simplex_projection=args.use_simplex_projection,
-            distill_target=args.distill_target,
-            temp_scheduler=temp_scheduler,
-            weight_optimizer_type=getattr(args, 'weight_optimizer_type', 'sgd'),
-            weight_adam_lr=getattr(args, 'weight_adam_lr', 0.001),
-            weight_adam_betas=getattr(args, 'weight_adam_betas', (0.9, 0.999)),
-            weight_adam_eps=getattr(args, 'weight_adam_eps', 1e-8),
-            coreset_weight_init=getattr(args, 'coreset_weight_init', 'uniform_random'),
-            model_type=args.net,
-            init_hyperparams=getattr(args, 'init_hyperparams', {}),
-            neumann_series_depth=getattr(args, 'bcsr_neumann_series_depth', 3))
+            tb_writer=tb_writer)
 
         # 在候选样本中进行精细筛选
         fine_idx, outer_loss = BCSR_Coreset_selector.coreset_select(
@@ -700,6 +511,15 @@ def one_fold(args, fold=0):
     # 初始化结果存储和已见类别跟踪
     results = []
     seen_classes = np.empty(0, dtype=int)
+
+    # ====== 加载预训练模型 checkpoint ======
+    ckpt_path = f'ckpt/fold_{fold}_task_0.pt'
+    if os.path.exists(ckpt_path):
+        print(f'Loading checkpoint from {ckpt_path}')
+        model.load_state_dict(torch.load(ckpt_path))
+        print(f'Checkpoint loaded successfully!')
+    else:
+        print(f'Warning: Checkpoint not found at {ckpt_path}, using randomly initialized model')
 
     # ====== 2. 任务序列训练主循环 ======
     for task in range(args.n_tasks):
@@ -882,11 +702,7 @@ def one_fold(args, fold=0):
 
                     # 更新训练损失并记录
                     train_loss_metric.update(loss.item())
-                    # 安全地记录损失（处理可能的 None 值）
-                    log_dict = {'bag_loss': bag_loss.item(), 'loss': loss.item()}
-                    if inst_loss is not None:
-                        log_dict['inst_loss'] = inst_loss.item()
-                    logger_batch.update(log_dict)
+                    logger_batch.update({'bag_loss': bag_loss.item(), 'inst_loss': inst_loss.item(), 'loss': loss.item()})
                     logger.log_metrics(logger_batch)
                 else:
                     raise NotImplementedError
@@ -1101,8 +917,7 @@ def one_fold(args, fold=0):
 
         # ====== 5. 内存缓冲区数据添加块 ======
         # 将当前任务的代表性样本添加到缓冲区，用于未来任务的回放训练
-        # 注意：最后一个任务不需要保存缓冲区（因为没有后续任务了）
-        if hasattr(args, 'cl_method') and hasattr(args, 'buffer_size') and args.buffer_size > 0 and task < args.n_tasks - 1:
+        if hasattr(args, 'cl_method') and hasattr(args, 'buffer_size') and args.buffer_size > 0:
             # 开始监控 buffer selection
             buffer_start_time = time.time()
             torch.cuda.empty_cache()
@@ -1112,6 +927,12 @@ def one_fold(args, fold=0):
             # 根据新增类别数量调整缓冲区大小
             buffer.adjust_buffer_size_by_new_classes(len(cur_classes))
             n_seen_samples_per_task = min(args.buffer_size, len(train_loader))
+
+            # ====== 初始化slide挑选监控指标 ======
+            slide_selection_metrics = []
+            total_original_patches = 0
+            total_compressed_patches = 0
+            samples_with_selection = 0
 
             # ====== 5.1 遍历训练数据并选择性添加到缓冲区 ======
             for batch_idx, batch in enumerate(train_loader):
@@ -1127,13 +948,20 @@ def one_fold(args, fold=0):
                     buffer_slide_size = args.buffer_slide_size * batch['features'].size(0) if isinstance(args.buffer_slide_size, float) else args.buffer_slide_size
                     batch = fabric.to_device(batch)
 
+                    # 记录原始patches数量
+                    original_patches = batch['features'].size(0)
+                    sample_label = batch['label'].item()
+
+                    # 开始计时
+                    slide_start_time = time.time()
+
                     # ====== 5.2.1 CLAM模型的特征蒸馏 ======
                     if args.net in ['clam_sb', 'clam_mb']:
                         with torch.no_grad():
                             out = model(batch['features'], batch['label'], seen_classes=seen_classes)
                             attn = out['A'].mean(dim=0, keepdim=True).view(1, -1)  # 获取注意力权重
                         # 基于注意力权重选择代表性特征
-                        slide = distill_slide(batch['features'], attn, size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'],task_id=task,seen_classes=seen_classes,tb_writer=tb_writer)
+                        slide = distill_slide(batch['features'].cpu(), attn.cpu(), size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'].cpu(),task_id=task,seen_classes=seen_classes,tb_writer=tb_writer)
                         batch['features'] = slide
 
                     # ====== 5.2.2 TransMIL模型的特征蒸馏 ======
@@ -1145,10 +973,30 @@ def one_fold(args, fold=0):
                         attn = (attn2 + 1) * (attn1 + 1) / 4  # 组合两层注意力
                         attn = attn.mean(dim=0, keepdim=True).view(1, -1)
                         # 基于注意力权重选择代表性特征
-                        slide = distill_slide(batch['features'], attn, size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'],seen_classes=seen_classes,tb_writer=tb_writer)
+                        slide = distill_slide(batch['features'].cpu(), attn.cpu(), size=buffer_slide_size, method=args.distill_method,model=model,label=batch['label'].cpu(),tb_writer=tb_writer)
                         batch['features'] = slide
                     else:
                         raise NotImplementedError
+
+                    # 结束计时并记录指标
+                    slide_end_time = time.time()
+                    compressed_patches = batch['features'].size(0)
+                    compression_ratio = compressed_patches / original_patches if original_patches > 0 else 0
+
+                    # 累积统计数据
+                    total_original_patches += original_patches
+                    total_compressed_patches += compressed_patches
+                    samples_with_selection += 1
+
+                    # 记录当前样本的指标
+                    slide_selection_metrics.append({
+                        'batch_idx': batch_idx,
+                        'label': sample_label,
+                        'original_patches': original_patches,
+                        'compressed_patches': compressed_patches,
+                        'compression_ratio': compression_ratio,
+                        'selection_time_ms': (slide_end_time - slide_start_time) * 1000
+                    })
 
                 # ====== 5.3 DER++方法的logits存储 ======
                 # 如果使用DER++方法，需要存储当前模型的输出logits
@@ -1170,12 +1018,47 @@ def one_fold(args, fold=0):
             print(f'Buffer size: {len(buffer)}')
             print(f'Number of patches in buffer: {buffer.n_patches_total}')
             print(f'Labels in buffer: {buffer.labels}')
+            # 确保目录存在
+            os.makedirs(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}', exist_ok=True)
             # 保存缓冲区类别分布到CSV文件
-            buffer_labels_dir = f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}'
-            os.makedirs(buffer_labels_dir, exist_ok=True)
-            with open(f'{buffer_labels_dir}/buffer_labels.csv', 'a') as f:
+            with open(f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/buffer_labels.csv', 'a') as f:
                 for key in buffer.labels.keys():
                     f.write("%s,%s\n"%(key,buffer.labels[key]))
+
+            # ====== 5.6 Slide挑选统计指标计算和保存 ======
+            if samples_with_selection > 0:
+                avg_original_patches = total_original_patches / samples_with_selection
+                avg_compressed_patches = total_compressed_patches / samples_with_selection
+                avg_compression_ratio = avg_compressed_patches / avg_original_patches if avg_original_patches > 0 else 0
+                total_selection_time = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / 1000  # 转换为秒
+                avg_selection_time_ms = sum([m['selection_time_ms'] for m in slide_selection_metrics]) / samples_with_selection
+
+                # 打印统计信息
+                print(f'\n===== Slide Selection Statistics =====')
+                print(f'Samples with slide selection: {samples_with_selection}')
+                print(f'Average original patches: {avg_original_patches:.2f}')
+                print(f'Average compressed patches: {avg_compressed_patches:.2f}')
+                print(f'Average compression ratio: {avg_compression_ratio:.4f}')
+                print(f'Total slide selection time: {total_selection_time:.2f} seconds')
+                print(f'Average selection time per sample: {avg_selection_time_ms:.2f} ms')
+                print(f'======================================\n')
+
+                # 保存详细指标到CSV文件
+                slide_metrics_df = pd.DataFrame(slide_selection_metrics)
+                slide_metrics_df.to_csv(
+                    f'{args.log_dir}/{args.exp_name}/fold_{fold}_task_{task}/slide_selection_details.csv',
+                    index=False
+                )
+
+                # 记录到logger
+                logger.log_metrics({
+                    'slide_samples_count': samples_with_selection,
+                    'slide_avg_original_patches': avg_original_patches,
+                    'slide_avg_compressed_patches': avg_compressed_patches,
+                    'slide_avg_compression_ratio': avg_compression_ratio,
+                    'slide_total_selection_time_seconds': total_selection_time,
+                    'slide_avg_selection_time_ms': avg_selection_time_ms
+                })
 
             # 结束监控并记录
             buffer_end_time = time.time()

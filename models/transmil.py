@@ -401,6 +401,9 @@ class TransMIL(nn.Module):
         logits = self._fc2(h)  # [B, n_classes]
         # Y_hat = torch.argmax(logits, dim=1)
         # Y_prob = F.softmax(logits, dim=1)
+        
+       
+        
         if return_attn:
             # attn: [B, n_heads, padding+1+H+add_length, padding+1+H+add_length]
             end_idx = - add_length if add_length > 0 else None
@@ -413,6 +416,7 @@ class TransMIL(nn.Module):
             attn2 = attn2.squeeze()[:, -H-add_length:end_idx]
             # vv1 = vv1[0, :, :end_idx, :] # [n_heads, N, dim_head]
             # vv2 = vv2[0, :, :end_idx, :]
+            # p?   exit()
             return {'logits': logits, 'features': h, 'attn1': attn1, 'attn2': attn2, 'h1': h1, 'h2': h2}
         else:
             return {'logits': logits, 'features': h}

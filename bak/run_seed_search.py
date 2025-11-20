@@ -514,10 +514,14 @@ def generate_commands(
     buffer_size: int,
     exp_name_prefix: str,
     seeds: List[int],
-    log_dir: str
+    log_dir: str,
+    extra_args: List[str] = None
 ) -> List[Dict]:
     """
     生成所有实验命令
+
+    Args:
+        extra_args: 额外传递给main_cl.py的参数列表
 
     Returns:
         List[Dict]: 包含命令和任务名称的字典列表
@@ -536,6 +540,10 @@ def generate_commands(
             "--seed", str(seed),
             "--log_dir", log_dir
         ]
+
+        # 添加额外参数
+        if extra_args:
+            cmd.extend(extra_args)
 
         commands.append({
             'cmd': cmd,

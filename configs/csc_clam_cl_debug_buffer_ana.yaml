@@ -1,0 +1,129 @@
+# ======================== 项目设置 ========================
+project: 'CMIL'                           # 项目名称
+exp_name: 'csc_clam_cl'                   # 实验名称
+wandb_mode: 'disabled'                    # 权重和偏差日志模式: 'online'(在线), 'offline'(离线), 'disabled'(禁用)
+log_dir: 'logs'                           # 日志和检查点保存目录
+
+# ======================== 模型设置 ========================
+model: clam_sb                            # 模型类型: clam_sb(单分支), clam_mb(多分支)
+net: 'clam_sb'                            # 网络架构
+D_feat: 512                               # 特征维度
+L: 512                                    # 隐藏层维度
+D: 256                                    # 另一个维度
+K: 1                                      # 注意力头数 (clam_sb: 1, clam_mb: n_classes)
+dropout: True                             # 是否使用dropout
+gate: True                                # 是否使用门控机制
+k_sample: 8                               # 采样补丁数量
+subtyping: True                           # 是否进行亚型分类
+instance_loss_name: 'svm'                 # 实例级损失函数类型
+bag_weight: 0.7                           # 包级损失权重 (实例级权重=1-bag_weight)
+feature_extractor: null                   # 特征提取器 (null表示使用内置提取器)
+
+# ======================== 数据集设置 ========================
+dataset: 'csc_cl'                         # 数据集名称
+data_root: './data'                       # 数据根目录
+feat_dir: 'embeddings'                    # 特征存储目录
+classes_order: ['2', '4', '0', '5', '3', '1']  # 类别顺序
+n_folds: 1                                # 交叉验证折数
+n_classes: 6                              # 类别总数
+n_tasks: 2                                # 任务数量 (持续学习中的任务轮数)
+
+# ======================== 训练设置 ========================
+batch_size: 1                             # 批次大小
+weighted_sample: False                    # 是否使用加权采样
+n_batches: -1                             # 每轮最大批次数 (-1表示全部)
+early_stop: False                         # 是否使用早停策略
+patience: 10                              # 早停耐心值 (无改进的轮数)
+opt: adam                                 # [主模型训练] 优化器: adam 或 sgd
+lr: [1e-4, 1e-4, 1e-4, 1e-4, 1e-4]       # [主模型训练] 学习率列表 (每个任务一个值)
+weight_decay: 0.                          # 权重衰减系数 (L2正则化)
+seed: 1                                   # 随机种子
+epochs: [0, 50, 50]                       # 每个任务的训练轮数
+# epochs: [1, 1, 1]                       # 调试用: 快速测试轮数
+testing: False                            # 是否仅进行测试 (不训练)
+load: null                                # 加载预训练模型路径 (null表示不加载)
+debug: 'False'                            # 调试模式: 'False'(正常), 'lite'(快速检查10步), 'full'(完整检查20步)
+folds_start: -1                           # 起始折 (-1为自动设置)
+folds_end: -1                             # 终止折 (-1为自动设置)
+
+# ======================== 持续学习设置 ========================
+cl_method: 'prev'                         # 持续学习方法: 'none'(无), 'finetune'(微调), 'ewc'(弹性权重), 'replay'(经验回放), 'prev'(注意力保持)
+buffer_balance: False                     # 缓冲区是否类别平衡
+
+buffer_size: 2                           # 缓冲区样本数 (每个任务保留的样本数)
+buffer_slide_size: 200                     # 缓冲样本的补丁数量限制
+#distill_method: 'maxmin'                 # 样本选择方法注释: 'max'(最大), 'random'(随机), 'maxmin'(极值混合), 'mix'(两阶段)
+distill_method: 'kibo'                    # 当前样本选择方法: 'kibo'(基于双水平优化的核心集选择)
+mix_coarse_ratio: mix                     # 混合方法的粗选比例 (粗选=精选×此比例)
+wn: False                                 # 是否使用权重归一化 (防止特征漂移)
+cl_on_current: False                      # 是否在当前任务数据上应用持续学习损失
+
+# ======================== BCSR核心集超参数 ========================
+# 【双水平优化】 内层循环 (Inner Loop) - 优化模型参数θ
+# 最佳配置评分: 0.7167
+bcsr_lr_proxy_model: 1.0                  # [内层优化] 代理模型的学习率 (优化θ)
+bcsr_beta: 0.01                           # [内层优化] 平衡超参数 (损失与正则项的权衡)
+bcsr_max_outer_it: 10                     # 外层最大迭代次数 (样本权重更新次数)
+bcsr_max_inner_it: 1                      # [内层优化] 内层最大迭代次数 (每次权重更新时的优化步数)
+bcsr_weight_lr: 1000                      # [外层优化] 样本权重的学习率 (优化w) ⚠️ 冗余参数,将被删除
+distall_lamda: 0.01                        # [内层优化] 知识蒸馏损失的拉格朗日乘数
+topk_method: 'gumbel'                     # [内层优化] TopK选择方法: 'sigmoid'(sigmoid), 'gumbel'(Gumbel采样), 'ste'(直通估计)
+topk_temperature: 0.5                     # [内层优化] TopK选择的温度参数 (控制软硬度)
+normalize_method: 'none'                # [内层优化] 权重归一化方法: 'l2'(L2范数), 'softmax'(softmax), 'zscore'(标准化), 'none'(无)
+use_simplex_projection: False              # [内层优化] 是否将权重投影到单纯形 (概率约束)
+distill_target: 'features'                # [内层优化] 知识蒸馏目标: 'logits'(输出), 'features'(特征), 'both'(两者)
+
+# ======================== 温度调度器配置 ========================
+use_temp_scheduler: False                 # 是否启用自适应温度调度
+temp_initial: 2.0                         # 初始温度 (高=软选择,更多探索)
+temp_final: 1                           # 最终温度 (低=硬选择,更快收敛)
+temp_strategy: 'cosine'                   # 温度衰减策略: 'linear'(线性), 'cosine'(余弦), 'exponential'(指数)
+
+# ======================== 权重优化器配置 ========================
+# 【双水平优化】 外层循环 (Outer Loop) - 优化样本权重w
+weight_optimizer_type: 'adam'              # [外层优化] 优化器类型: 'sgd'(随机梯度下降) 或 'adam'(自适应动量估计)
+weight_adam_lr: 200                     # [外层优化] 权重优化器初始学习率 (优化w)
+weight_adam_betas: [0.9, 0.999]           # [外层优化] Adam的β参数 (动量系数: [β1, β2])
+weight_adam_eps: 1e-8                     # [外层优化] Adam的ε参数 (数值稳定性)
+
+# ======================== 学习率调度器配置 ========================
+# 【双水平优化】 外层循环学习率衰减 - 控制样本权重w的学习率动态变化
+use_lr_scheduler: False                   # [外层优化] 是否启用权重优化器的学习率调度
+lr_initial: 0.001                         # [外层优化] 初始学习率 (默认为weight_adam_lr)
+lr_final: 0.0001                          # [外层优化] 最终学习率 (衰减目标)
+lr_strategy: 'cosine'                     # [外层优化] 学习率衰减策略: 'linear'(线性), 'cosine'(余弦), 'exponential'(指数)
+
+# ======================== 可视化设置 ========================
+draw_curve: False                         # 是否绘制收敛曲线
+
+# ======================== 核心集权重初始化配置 ========================
+# 【核心集初始化】初始化方法: 'uniform_random'(均匀随机), 'uniform_equal'(等权重),
+#                 'gaussian'(高斯分布), 'attention_based'(注意力),
+#                 'entropy_based'(熵), 'hybrid'(混合)
+coreset_weight_init: 'uniform_random'    # 当前初始化方法
+init_hyperparams:                         # 初始化方法的超参数配置
+  # 均匀随机参数
+  low: 0.0                                # 随机范围下界
+  high: 1.0                               # 随机范围上界
+
+  # 均匀等权重参数
+  base_value: null                        # null则为1/n，否则使用指定值
+
+  # 高斯分布参数
+  mean: 0.5                               # 正态分布均值
+  std: 0.2                                # 正态分布标准差
+  activation: 'sigmoid'                   # 激活函数: 'sigmoid' 或 'relu'
+
+  # 注意力基础参数
+  aggregation: 'mean'                     # 聚合方法: 'mean'(均值), 'max'(最大), 'weighted_mean'(加权均值)
+  normalize: True                         # 是否归一化
+  temperature: 1.0                        # 温度参数 (越大越平滑)
+
+  # 熵基础参数
+  normalization: 'minmax'                 # 归一化方法: 'minmax' 或 'softmax'
+  inverse: True                           # 低熵高权重 (True) 或 高熵高权重 (False)
+  eps: 1e-8                               # 数值稳定性参数
+
+  # 混合方法参数
+  attention_weight: 0.7                   # 注意力权重占比
+  entropy_weight: 0.3                     # 熵权重占比
